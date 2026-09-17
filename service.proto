@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package bidir;
+
+enum Opcode {
+  UNKNOWN = 0;
+  PING = 1;
+  DATA = 2;
+  STATUS = 3;
+  CLOSE = 4;
+}
+
+message Request {
+  Opcode opcode = 1;
+  int32 id = 2;
+  string payload = 3;
+  bool active = 4;
+  float value = 5;
+}
+
+message Response {
+  Opcode opcode = 1;
+  int32 id = 2;
+  string message = 3;
+  bool success = 4;
+  float result = 5;
+}
+
+service BidirService {
+  rpc Stream(stream Request) returns (stream Response);
+}
