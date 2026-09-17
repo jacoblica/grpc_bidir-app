@@ -46,8 +46,8 @@ class BidirServiceImpl final : public BidirService::Service {
     }
 };
 
-void RunServer() {
-    std::string server_address("0.0.0.0:50051");
+void RunServer(const std::string& listen_address) {
+    std::string server_address = listen_address;
     BidirServiceImpl service;
 
     ServerBuilder builder;
@@ -59,6 +59,7 @@ void RunServer() {
 }
 
 int main(int argc, char** argv) {
-    RunServer();
+    std::string address = (argc > 1) ? argv[1] : "0.0.0.0:50051";
+    RunServer(address);
     return 0;
 }

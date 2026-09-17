@@ -1,6 +1,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
 #include <thread>
@@ -16,8 +17,9 @@ using bidir::Opcode;
 
 class BidirClient {
 public:
-    BidirClient(std::shared_ptr<Channel> channel)
-        : stub_(BidirService::NewStub(channel)) {}
+    BidirClient(const std::string& address)
+        : stub_(BidirService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))),
+          address_(address) {}
 
     void Stream() {
         ClientContext context;
@@ -25,14 +27,16 @@ public:
             stub_->Stream(&context));
 
         // Thread to read responses
-        std::thread reader([stream]() {
+        std::thread reader([this, stream]() {
+            std::cout << "Reader thread started for " << address_ << std::endl;
             Response response;
             while (stream->Read(&response)) {
                 // Placeholder: Extract Opcode and dispatch response
                 Opcode op = response.opcode();
-                std::cout << "Received response with opcode: " << op 
+                std::cout << "[" << address_ << "] Received response with opcode: " << op
                           << ", message: " << response.message() << std::endl;
             }
+            std::cout << "[" << address_ << "] Stream closed by server" << std::endl;
         });
 
         // Send requests
@@ -50,16 +54,38 @@ public:
         reader.join();
         Status status = stream->Finish();
         if (!status.ok()) {
-            std::cout << "Stream failed: " << status.error_message() << std::endl;
+            std::cout << "[" << address_ << "] Stream failed: " << status.error_message() << std::endl;
         }
     }
 
 private:
     std::unique_ptr<BidirService::Stub> stub_;
+    std::string address_;
 };
 
 int main(int argc, char** argv) {
-    BidirClient client(grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials()));
-    client.Stream();
+    std::vector<std::string> addresses;
+    if (argc > 1) {
+        for (int i = 1; i < argc; ++i) {
+            addresses.push_back(argv[i]);
+        }
+    } else {
+        addresses.push_back("localhost:50051");
+    }
+
+    std::vector<std::thread> threads;
+    for (const auto& address : addresses) {
+        std::cout << "Connecting to server at " << address << std::endl;
+        threads.emplace_back([address]() {
+            BidirClient client(address);
+            client.Stream();
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    std::cout << "All streams finished" << std::endl;
     return 0;
 }
