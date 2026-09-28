@@ -1,35 +1,57 @@
+#include <condition_variable>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
 
-using grpc::CallbackServerContext;
-using grpc::Server;
-using grpc::ServerBuilder;
-using grpc::ServerBidiReactor;
-using grpc::ServerContext;
-using grpc::ServerReaderWriter;
+using grpc::ClientBidiReactor;
+using grpc::ClientContext;
 using grpc::Status;
 using bidir::BidirService;
 using bidir::Request;
 using bidir::Response;
 using bidir::Opcode;
 
-class StreamReactor final : public ServerBidiReactor<Request, Response> {
+class BidirClient;
+
+class BidirClient {
 public:
-    StreamReactor() {
-        // Kick off the read/write callback loop by requesting the first message.
+    explicit BidirClient(const std::string& address);
+    void Stream();
+    const std::string& address() const { return address_; }
+    void SignalDone();
+
+private:
+    std::string address_;
+    std::unique_ptr<BidirService::Stub> stub_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool done_ = false;
+};
+
+// The server now dials out to the listening client, so a reactor per call.
+// Reactor type order is <outbound, inbound>: the dialing side writes Response
+// messages and reads Request messages.
+class StreamReactor final : public ClientBidiReactor<Response, Request> {
+public:
+    StreamReactor(BidirClient* owner, std::unique_ptr<ClientContext> context)
+        : owner_(owner), context_(std::move(context)) {}
+
+    void KickOff(BidirService::Stub* stub) {
+        // Start the RPC with this reactor bound to it.
+        stub->experimental_async()->Stream(context_.get(), this);
+        // Await the client's requests.
         StartRead(&request_);
+        StartCall();
     }
 
     void OnReadDone(bool ok) override {
-        if (finished_) return;
         if (!ok) {
-            // Client closed its write side (WritesDone) or the call ended.
-            Finish(Status::OK);
-            finished_ = true;
+            // The client half-closed; nothing more to respond to.
             return;
         }
 
@@ -58,52 +80,70 @@ public:
     }
 
     void OnWriteDone(bool ok) override {
-        if (finished_) return;
-        if (!ok) {
-            Finish(Status(grpc::StatusCode::INTERNAL, "Write failed"));
-            finished_ = true;
-            return;
-        }
+        if (!ok) return;
         StartRead(&request_);
     }
 
-    void OnCancel() override {
-        if (!finished_) {
-            Finish(Status(grpc::StatusCode::CANCELLED, "Call cancelled"));
-            finished_ = true;
-        }
-    }
-
-    void OnDone() override {
-        // RPC is fully complete; safe to reclaim the reactor.
+    void OnDone(const Status& s) override {
+        std::cout << "[" << owner_->address() << "] Stream finished: "
+                  << (s.ok() ? "OK" : s.error_message()) << std::endl;
+        owner_->SignalDone();
         delete this;
     }
 
 private:
-    Request request_;
-    Response response_;
-    bool finished_ = false;
+    BidirClient* owner_;
+    std::unique_ptr<ClientContext> context_;
+    Request request_;   // Buffer for the read in flight.
+    Response response_; // Buffer for the write in flight.
 };
 
-class BidirServiceImpl final : public BidirService::CallbackService {
-    ServerBidiReactor<Request, Response>* Stream(CallbackServerContext* context) override {
-        return new StreamReactor();
+BidirClient::BidirClient(const std::string& address)
+    : address_(address),
+      stub_(BidirService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
+
+void BidirClient::Stream() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        done_ = false;
     }
-};
+    std::unique_ptr<ClientContext> context = std::make_unique<ClientContext>();
+    StreamReactor* reactor = new StreamReactor(this, std::move(context));
+    reactor->KickOff(stub_.get());
 
-void RunServer(const std::string& listen_address) {
-    BidirServiceImpl service;
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [this] { return done_; });
+}
 
-    ServerBuilder builder;
-    builder.AddListeningPort(listen_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
-    std::unique_ptr<Server> server(builder.BuildAndStart());
-    std::cout << "Server listening on " << listen_address << std::endl;
-    server->Wait();
+void BidirClient::SignalDone() {
+    std::lock_guard<std::mutex> lk(mu_);
+    done_ = true;
+    cv_.notify_one();
 }
 
 int main(int argc, char** argv) {
-    std::string address = (argc > 1) ? argv[1] : "0.0.0.0:50051";
-    RunServer(address);
+    std::vector<std::string> addresses;
+    if (argc > 1) {
+        for (int i = 1; i < argc; ++i) {
+            addresses.push_back(argv[i]);
+        }
+    } else {
+        addresses.push_back("localhost:50051");
+    }
+
+    std::vector<std::thread> threads;
+    for (const auto& address : addresses) {
+        std::cout << "Connecting to client at " << address << std::endl;
+        threads.emplace_back([address]() {
+            BidirClient client(address);
+            client.Stream();
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    std::cout << "All streams finished" << std::endl;
     return 0;
 }

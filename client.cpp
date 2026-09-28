@@ -1,132 +1,149 @@
-#include <condition_variable>
+#include <atomic>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
 
-using grpc::ClientBidiReactor;
-using grpc::ClientContext;
-using grpc::ClientReaderWriter;
+using grpc::CallbackServerContext;
+using grpc::Server;
+using grpc::ServerBidiReactor;
+using grpc::ServerBuilder;
 using grpc::Status;
 using bidir::BidirService;
 using bidir::Request;
 using bidir::Response;
 using bidir::Opcode;
 
-class BidirClient;
-class StreamReactor;
+// The client now listens; the server dials in, so identify each accepted stream.
+namespace {
+std::atomic<int> g_next_conn_id{0};
+}  // namespace
 
-class BidirClient {
+// Reactor type order is <inbound, outbound>: the listening side reads Response
+// messages and writes Request messages.
+class StreamReactor final : public ServerBidiReactor<Response, Request> {
 public:
-    explicit BidirClient(const std::string& address);
-    void Stream();
-    const std::string& address() const { return address_; }
-    void SignalDone();
+    StreamReactor() : conn_id_(g_next_conn_id++) {
+        Request ping;
+        ping.set_opcode(Opcode::PING);
+        ping.set_id(1);
+        requests_.push_back(ping);
 
-private:
-    std::string address_;
-    std::unique_ptr<BidirService::Stub> stub_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    bool done_ = false;
-};
+        Request data;
+        data.set_opcode(Opcode::DATA);
+        data.set_id(2);
+        data.set_payload("Hello Server");
+        requests_.push_back(data);
 
-class StreamReactor final : public ClientBidiReactor<Request, Response> {
-public:
-    StreamReactor(BidirClient* owner, std::unique_ptr<ClientContext> context)
-        : owner_(owner), context_(std::move(context)) {
-        Request r;
-        r.set_opcode(Opcode::PING);
-        r.set_id(1);
-        requests_.push_back(r);
-
-        Request d;
-        d.set_opcode(Opcode::DATA);
-        d.set_id(2);
-        d.set_payload("Hello Server");
-        requests_.push_back(d);
-    }
-
-    void KickOff(BidirService::Stub* stub) {
-        // Start the RPC with this reactor bound to it.
-        stub->experimental_async()->Stream(context_.get(), this);
-        // Post the initial read so responses are awaited as soon as the call starts.
+        // Await responses and send our first request.
         StartRead(&response_);
-        WriteNext();
-        StartCall();
-    }
-
-    void WriteNext() {
-        if (write_idx_ < requests_.size()) {
-            request_ = requests_[write_idx_++];
-            StartWrite(&request_);
-        } else {
-            StartWritesDone();
-        }
-    }
-
-    void OnWriteDone(bool ok) override {
-        if (ok) {
-            WriteNext();
-        }
-    }
-
-    void OnWritesDoneDone(bool ok) override {
-        // All requests sent; the server decides when to close the stream.
-        (void)ok;
+        SendNext();
     }
 
     void OnReadDone(bool ok) override {
-        if (!ok) return;  // No more responses; await OnDone.
+        if (finished_) return;
+        if (!ok) {
+            // The server closed the stream.
+            Finish(Status::OK);
+            finished_ = true;
+            return;
+        }
 
         // Placeholder: Extract Opcode and dispatch response
         Opcode op = response_.opcode();
-        std::cout << "[" << owner_->address() << "] Received response with opcode: " << op
+        std::cout << "[conn " << conn_id_ << "] Received response with opcode: " << op
                   << ", message: " << response_.message() << std::endl;
-        StartRead(&response_);
+
+        ++responses_received_;
+        if (responses_received_ < requests_.size()) {
+            StartRead(&response_);
+            return;
+        }
+        // Every request has been answered; close the call like the blocking
+        // version did once its reader thread finished.
+        MaybeFinish();
     }
 
-    void OnDone(const Status& s) override {
-        std::cout << "[" << owner_->address() << "] Stream finished: "
-                  << (s.ok() ? "OK" : s.error_message()) << std::endl;
-        owner_->SignalDone();
+    void OnWriteDone(bool ok) override {
+        if (finished_) return;
+        if (!ok) {
+            Finish(Status(grpc::StatusCode::INTERNAL, "Write failed"));
+            finished_ = true;
+            return;
+        }
+        write_in_flight_ = false;
+        if (write_idx_ < requests_.size()) {
+            SendNext();
+            return;
+        }
+        MaybeFinish();
+    }
+
+    void OnCancel() override {
+        if (!finished_) {
+            Finish(Status(grpc::StatusCode::CANCELLED, "Call cancelled"));
+            finished_ = true;
+        }
+    }
+
+    void OnDone() override {
+        // RPC is fully complete; safe to reclaim the reactor.
         delete this;
     }
 
 private:
-    BidirClient* owner_;
-    std::unique_ptr<ClientContext> context_;
+    void SendNext() {
+        // StartWriteLast is deliberately not used: it defers the message so it can
+        // be coalesced with the trailing metadata of Finish, which would stall the
+        // peer waiting for a request that never leaves this process.
+        request_ = requests_[write_idx_++];
+        write_in_flight_ = true;
+        StartWrite(&request_);
+    }
+
+    // The server role has no WritesDone, so the call is closed here once every
+    // request has been sent and every response has come back, and no operation
+    // is still in flight.
+    void MaybeFinish() {
+        if (finished_ || write_in_flight_) return;
+        if (write_idx_ < requests_.size() || responses_received_ < requests_.size()) return;
+        Finish(Status::OK);
+        finished_ = true;
+    }
+
+    int conn_id_;
     std::vector<Request> requests_;
     std::size_t write_idx_ = 0;
+    std::size_t responses_received_ = 0;
     Request request_;    // Buffer for the write in flight.
     Response response_;  // Buffer for the read in flight.
+    bool write_in_flight_ = false;
+    bool finished_ = false;
 };
 
-BidirClient::BidirClient(const std::string& address)
-    : address_(address),
-      stub_(BidirService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
-
-void BidirClient::Stream() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        done_ = false;
+class BidirServiceImpl final : public BidirService::CallbackService {
+    ServerBidiReactor<Response, Request>* Stream(CallbackServerContext* context) override {
+        std::cout << "Server connected, starting stream" << std::endl;
+        return new StreamReactor();
     }
-    std::unique_ptr<ClientContext> context = std::make_unique<ClientContext>();
-    StreamReactor* reactor = new StreamReactor(this, std::move(context));
-    reactor->KickOff(stub_.get());
+};
 
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [this] { return done_; });
-}
+void RunListener(const std::string& listen_address) {
+    BidirServiceImpl service;
 
-void BidirClient::SignalDone() {
-    std::lock_guard<std::mutex> lk(mu_);
-    done_ = true;
-    cv_.notify_one();
+    ServerBuilder builder;
+    builder.AddListeningPort(listen_address, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service);
+    std::unique_ptr<Server> server(builder.BuildAndStart());
+    if (!server) {
+        std::cout << "Failed to listen on " << listen_address << std::endl;
+        return;
+    }
+    std::cout << "Client listening on " << listen_address << std::endl;
+    server->Wait();
 }
 
 int main(int argc, char** argv) {
@@ -136,22 +153,16 @@ int main(int argc, char** argv) {
             addresses.push_back(argv[i]);
         }
     } else {
-        addresses.push_back("localhost:50051");
+        addresses.push_back("0.0.0.0:50051");
     }
 
     std::vector<std::thread> threads;
     for (const auto& address : addresses) {
-        std::cout << "Connecting to server at " << address << std::endl;
-        threads.emplace_back([address]() {
-            BidirClient client(address);
-            client.Stream();
-        });
+        threads.emplace_back([address]() { RunListener(address); });
     }
 
     for (auto& t : threads) {
         t.join();
     }
-
-    std::cout << "All streams finished" << std::endl;
     return 0;
 }

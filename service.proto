@@ -27,5 +27,9 @@ message Response {
 }
 
 service BidirService {
-  rpc Stream(stream Request) returns (stream Response);
+  // The client listens and the server dials, so the roles are reversed from the
+  // usual gRPC convention: the dialing side (server) sends Request messages and
+  // receives Response messages, while the listening side (client) does the
+  // opposite. Hence the request type of this rpc is the stream the client sends.
+  rpc Stream(stream Response) returns (stream Request);
 }
