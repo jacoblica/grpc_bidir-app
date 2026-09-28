@@ -1,3 +1,4 @@
+#include <chrono>
 #include <csignal>
 #include <iostream>
 #include <memory>
@@ -8,65 +9,52 @@
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
 
-using grpc::CallbackServerContext;
 using grpc::Server;
 using grpc::ServerBuilder;
-using grpc::ServerBidiReactor;
 using grpc::ServerContext;
 using grpc::ServerReaderWriter;
 using grpc::Status;
+using grpc::StatusCode;
 using bidir::BidirService;
 using bidir::Request;
 using bidir::Response;
 using bidir::Opcode;
 
-class BidirServiceImpl;
+namespace {
+
+std::mutex g_log_mu;
+
+// Each stream is handled on its own gRPC sync thread; keep stdout readable.
+void Log(const std::string& line) {
+    std::lock_guard<std::mutex> lk(g_log_mu);
+    std::cout << line << std::endl;
+}
+
+}  // namespace
 
 // This process is the *listener*: it hosts the gRPC server and only ever
 // receives. The pushing peer connects to it and writes date/time messages.
-class StreamReactor final : public ServerBidiReactor<Request, Response> {
+class BidirServiceImpl final : public BidirService::Service {
 public:
-    StreamReactor() {
-        // Nothing is ever written back; arm a read to receive the pushed messages.
-        StartRead(&request_);
-    }
+    // Note the generated sync signature is ServerReaderWriter<W, R>: the *write*
+    // type comes first, so this reads Request (written by the peer) and would
+    // write Response.
+    Status Stream(ServerContext* context, ServerReaderWriter<Response, Request>* stream) override {
+        Log("Push source connected");
 
-    void OnReadDone(bool ok) override {
-        if (finished_) return;
-        if (!ok) {
-            // Push source closed its write side or went away.
-            std::cout << "Push source disconnected" << std::endl;
-            finished_ = true;
-            Finish(Status::OK);
-            return;
+        // Blocking read/write loop: one blocking Read per pushed message. Read
+        // returns false when the push source half-closes or goes away.
+        Request request;
+        while (stream->Read(&request)) {
+            // The peer pushes unsolicited STATUS updates carrying a date/time string.
+            Log("#" + std::to_string(request.id()) + " " + request.payload());
         }
 
-        // The peer pushes unsolicited STATUS updates carrying a date/time string.
-        std::cout << "#" << request_.id() << " " << request_.payload() << std::endl;
-        StartRead(&request_);
-    }
-
-    void OnCancel() override {
-        if (!finished_) {
-            finished_ = true;
-            Finish(Status(grpc::StatusCode::CANCELLED, "Call cancelled"));
+        Log("Push source disconnected");
+        if (context->IsCancelled()) {
+            return Status(StatusCode::CANCELLED, "Listener shutting down");
         }
-    }
-
-    void OnDone() override {
-        // RPC is fully complete; safe to reclaim the reactor.
-        delete this;
-    }
-
-private:
-    Request request_;  // Buffer for the read in flight.
-    bool finished_ = false;
-};
-
-class BidirServiceImpl final : public BidirService::CallbackService {
-    ServerBidiReactor<Request, Response>* Stream(CallbackServerContext* context) override {
-        std::cout << "Push source connected" << std::endl;
-        return new StreamReactor();
+        return Status::OK;
     }
 };
 
@@ -94,7 +82,9 @@ void RunListener(const std::string& listen_address) {
         int signal_number = 0;
         if (sigwait(&signals, &signal_number) == 0) {
             std::cout << "Received signal " << signal_number << ", shutting down" << std::endl;
-            server->Shutdown();
+            // The deadline is what unblocks the in-flight blocking Read; without
+            // it Wait() would hang until the push source disconnected on its own.
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
         }
     });
 

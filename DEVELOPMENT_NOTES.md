@@ -11,6 +11,9 @@ connection direction inverted: the `client` process is the gRPC **server** (it l
 - `server.cpp` — the **pusher**: dials one or more listeners and writes a formatted date/time string every 3 seconds.
 - `CMakeLists.txt` / `build.sh` — build (protoc codegen + CMake).
 
+Both sides use the **synchronous/blocking API** (`BidirService::Service::Stream` on the listener,
+`Stub::Stream(&context)` returning a `ClientReaderWriter` on the pusher). There are no reactors.
+
 The wire direction is fixed by the `Stream` signature: whoever acts as the gRPC client writes
 `Request` messages and whoever acts as the gRPC server reads them. The date/time therefore travels
 in `Request.payload` (`opcode = STATUS`, `id` = per-connection push counter).
@@ -39,6 +42,8 @@ Start the listener first, then the pusher. Either process can be stopped with Ct
   otherwise `0.0.0.0:50051`.
 
 ### 3. Conversion to the asynchronous callback API
+
+(Superseded by change 6; kept for history. Both sides now use the blocking API again.)
 
 Previously both sides used the blocking/synchronous API (client `stub_->Stream(&context)` on a thread; server overriding `BidirService::Service::Stream`).
 
@@ -83,8 +88,27 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
   any number of simultaneous push sources.
 - Added a `Log()` helper in the pusher so concurrent connection threads cannot interleave on stdout.
 
+### 6. Back to the synchronous/blocking API
+
+- `client.cpp` (listener) derives from `BidirService::Service` and implements
+  `Status Stream(ServerContext*, ServerReaderWriter<Response, Request>*)` with a blocking
+  `while (stream->Read(&request))` loop. Each stream is served on its own gRPC sync thread.
+- `server.cpp` (pusher) uses `stub_->Stream(&context)`; the loop is a blocking `stream->Write(...)`
+  every 3 seconds, then `WritesDone()` + `Finish()`. No reactor, no per-connection ticker thread.
+- `WaitInterval()` sleeps the 3s interval in 200ms slices, because a signal handler cannot touch the
+  mutex/condition variable that a `cv_.wait_for` would need; Ctrl-C is therefore honoured within
+  ~200ms instead of up to a full interval.
+- The listener's `Server::Shutdown()` now takes a 1s deadline: the in-flight blocking `Read` has to be
+  cancelled for `Wait()` to return.
+- Added `Log()` (mutex-guarded `std::cout`) to the listener as well, since each handler runs on a
+  different thread there.
+
 ## Gotchas / Lessons Learned
 
+- **Sync bidi handler signature is `ServerReaderWriter<W, R>`, not `<R, W>`.** protoc generates
+  `Service::Stream(ServerContext*, ServerReaderWriter<Response, Request>*)` for
+  `rpc Stream(stream Request) returns (stream Response)` — the *write* type is the first template
+  argument, so `Read()` fills a `Request` and `Write()` takes a `Response`.
 - **Client reactors have no operation backlog.** Unlike `ServerBidiReactor`, whose `StartRead`/`StartWrite` queue work even before the stream is bound, `ClientBidiReactor::StartRead` calls `stream_->Read(...)` directly. Calling `StartRead` in the reactor constructor (before `experimental_async()->Stream(...)`) dereferences a null `stream_` and segfaults. Post the first read **after** binding, before `StartCall()`.
 - **`StartCall()` is mandatory** for every client reactor, even if the RPC is cancelled.
 - **Message lifetime:** a message passed to `StartRead`/`StartWrite` must remain valid and unmodified until the corresponding `OnReadDone`/`OnWriteDone` fires. Member buffers are used for this reason.
@@ -110,5 +134,6 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
   clean-exit messages no longer interleaved.
 - `SIGKILL`'d both pushers mid-stream: the listener logged `Push source disconnected` twice, stayed
   up, and a new pusher connected and streamed normally.
-- Ctrl-C on the pusher -> `Stream finished: CANCELLED` / `All streams finished`; Ctrl-C on the
+- Ctrl-C on the pusher -> `Stream finished: OK` / `All streams finished`; Ctrl-C on the
   listener -> `Received signal 2, shutting down` / `Listener stopped`. Both exit code 0.
+- Re-ran the whole suite after the sync rewrite: same behaviour, no interleaved log lines.
