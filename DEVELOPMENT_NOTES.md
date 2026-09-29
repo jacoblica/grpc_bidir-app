@@ -2,31 +2,30 @@
 
 ## Project Overview
 
-`grpc_bidir-app` is a C++ gRPC example demonstrating a **bidirectional streaming** RPC with the
-connection direction inverted: the `client` process is the gRPC **server** (it listens) and the
-`server` process is the gRPC **client** (it dials out and pushes).
+`grpc_bidir-app` is a C++ gRPC example demonstrating a **bidirectional streaming** RPC where the
+server is the sole writer: it listens, and every connected client receives a date/time string
+every 3 seconds.
 
 - `service.proto` — defines `BidirService.Stream` (bidirectional stream) plus `Request`/`Response` messages. Each message has 5 fields: `Opcode` enum, `int32`, `string`, `bool`, `float`.
-- `client.cpp` — the **listener**: hosts the gRPC server (default listen address `0.0.0.0:50051`) and only receives.
-- `server.cpp` — the **pusher**: dials one or more listeners and writes a formatted date/time string every 3 seconds.
+- `server.cpp` — the gRPC **server**: listens (default `0.0.0.0:50051`), and its stream handler writes a formatted date/time to each connected client every 3 seconds.
+- `client.cpp` — the gRPC **client**: connects to one or more servers and only reads.
 - `CMakeLists.txt` / `build.sh` — build (protoc codegen + CMake).
 
-Both sides use the **synchronous/blocking API** (`BidirService::Service::Stream` on the listener,
-`Stub::Stream(&context)` returning a `ClientReaderWriter` on the pusher). There are no reactors.
+Both sides use the **synchronous/blocking API** (`BidirService::Service::Stream` on the server,
+`Stub::Stream(&context)` returning a `ClientReaderWriter` on the client). There are no reactors.
 
-The wire direction is fixed by the `Stream` signature: whoever acts as the gRPC client writes
-`Request` messages and whoever acts as the gRPC server reads them. The date/time therefore travels
-in `Request.payload` (`opcode = STATUS`, `id` = per-connection push counter).
+The date/time travels in `Response.message` (`opcode = STATUS`, `id` = per-connection push counter),
+since the server is the writing side of the stream.
 
 ## Build & Run
 
 ```bash
 ./build.sh                       # cleans build/, runs cmake + make
-./build/client                   # listener; listen address is optional (default 0.0.0.0:50051)
-./build/server localhost:50051   # pusher; accepts any number of listener addresses
+./build/server 0.0.0.0:50051     # listener/pusher; listen address is optional
+./build/client localhost:50051   # receiver; accepts any number of server addresses
 ```
 
-Start the listener first, then the pusher. Either process can be stopped with Ctrl-C.
+Start the server first, then the client. Either process can be stopped with Ctrl-C.
 
 ## Session Changes
 
@@ -90,10 +89,10 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 
 ### 6. Back to the synchronous/blocking API
 
-- `client.cpp` (listener) derives from `BidirService::Service` and implements
+- `server.cpp` (listener) derives from `BidirService::Service` and implements
   `Status Stream(ServerContext*, ServerReaderWriter<Response, Request>*)` with a blocking
   `while (stream->Read(&request))` loop. Each stream is served on its own gRPC sync thread.
-- `server.cpp` (pusher) uses `stub_->Stream(&context)`; the loop is a blocking `stream->Write(...)`
+- `client.cpp` (pusher) uses `stub_->Stream(&context)`; the loop is a blocking `stream->Write(...)`
   every 3 seconds, then `WritesDone()` + `Finish()`. No reactor, no per-connection ticker thread.
 - `WaitInterval()` sleeps the 3s interval in 200ms slices, because a signal handler cannot touch the
   mutex/condition variable that a `cv_.wait_for` would need; Ctrl-C is therefore honoured within
@@ -103,12 +102,28 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 - Added `Log()` (mutex-guarded `std::cout`) to the listener as well, since each handler runs on a
   different thread there.
 
+### 7. Server listens, server pushes; client connects and receives
+
+- `server.cpp` is the gRPC server *and* the only writer: its handler runs a blocking
+  `stream->Write(response)` every 3 seconds (`Response.message` = timestamp, `id` = per-connection
+  counter) and treats `Write() == false` as the disconnect signal, since the handler never reads.
+  A client half-close is therefore noticed within one interval.
+- `client.cpp` is a pure reader: `while (stream->Read(&response))` + `Finish()`.
+- A blocking `Read` cannot be interrupted by a flag, so the client keeps a small registry of active
+  `ClientContext`s; a `sigwait` thread cancels all of them on SIGINT/SIGTERM, which unblocks the
+  pending `Read` and lets `Finish()` report `CANCELLED`.
+- The server's `sigwait` thread sets `g_stop` (so the handler's interval wait returns early) and
+  then calls `Shutdown(deadline)`.
+
 ## Gotchas / Lessons Learned
 
 - **Sync bidi handler signature is `ServerReaderWriter<W, R>`, not `<R, W>`.** protoc generates
   `Service::Stream(ServerContext*, ServerReaderWriter<Response, Request>*)` for
   `rpc Stream(stream Request) returns (stream Response)` — the *write* type is the first template
   argument, so `Read()` fills a `Request` and `Write()` takes a `Response`.
+- **Method signatures fix the wire direction.** Swapping who listens and who dials also swaps who
+  writes `Request` and who writes `Response`; the payload has to live in the message the writing
+  side is allowed to write.
 - **Client reactors have no operation backlog.** Unlike `ServerBidiReactor`, whose `StartRead`/`StartWrite` queue work even before the stream is bound, `ClientBidiReactor::StartRead` calls `stream_->Read(...)` directly. Calling `StartRead` in the reactor constructor (before `experimental_async()->Stream(...)`) dereferences a null `stream_` and segfaults. Post the first read **after** binding, before `StartCall()`.
 - **`StartCall()` is mandatory** for every client reactor, even if the RPC is cancelled.
 - **Message lifetime:** a message passed to `StartRead`/`StartWrite` must remain valid and unmodified until the corresponding `OnReadDone`/`OnWriteDone` fires. Member buffers are used for this reason.
@@ -120,20 +135,22 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
   `can_inline=false`, so a reaction can never run on the thread that called `StartWrite` (that would
   self-deadlock on the reactor's mutex). `ClientCallbackReaderWriterImpl` has no backlog, so the
   first read must still be posted after binding.
-- **Method signatures fix the wire direction.** Swapping who listens and who dials also swaps who
-  writes `Request` and who writes `Response`; the payload has to move to the message the pushing
-  side is allowed to write.
-- Interleaved stdout from concurrent pusher threads is expected unless serialized (`Log()` does this).
+- **A blocking `Read` needs a cancellation path.** A flag cannot unblock it; register the
+  `ClientContext` and call `TryCancel()` from a `sigwait` thread when Ctrl-C must be graceful.
+- **`Server::Shutdown()` without a deadline waits for in-flight RPCs**, so a handler parked in
+  `Read` would keep `Wait()` blocked until the client left on its own.
+- Interleaved stdout from concurrent handler/client threads is expected; `Log()` serializes it.
 - Not used but available: completion-queue async (`BidirService::AsyncService::RequestStream`).
 
 ## Testing Performed
 
 - Built cleanly via `./build.sh`.
-- One pusher against one listener: timestamps arrived at 3s intervals (`18:58:57`, `18:59:00`).
-- Two concurrent pushers against one listener: both streamed with independent counters, and their
-  clean-exit messages no longer interleaved.
-- `SIGKILL`'d both pushers mid-stream: the listener logged `Push source disconnected` twice, stayed
-  up, and a new pusher connected and streamed normally.
-- Ctrl-C on the pusher -> `Stream finished: OK` / `All streams finished`; Ctrl-C on the
-  listener -> `Received signal 2, shutting down` / `Listener stopped`. Both exit code 0.
-- Re-ran the whole suite after the sync rewrite: same behaviour, no interleaved log lines.
+- Server pushes timestamps to a connected client at 3s intervals (`20:07:13`, `20:07:16`, `20:07:19`).
+- Two clients connected at once: each got its own per-connection counter and cadence; the server
+  logged two `Client connected` lines.
+- `SIGKILL`'d both clients mid-stream: the server logged `Client disconnected` and kept serving; a
+  reconnecting client streamed normally.
+- Client against a closed port -> `failed to connect to all addresses`, exit code 0.
+- Ctrl-C on the client -> `Stream finished: CANCELLED` / `All streams finished`; Ctrl-C on the
+  server -> `Received signal 2, shutting down` / `Server stopped`. Both exit code 0.
+- Re-ran the whole suite after each role/API change.

@@ -7,16 +7,19 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <vector>
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
 
-using grpc::ClientContext;
-using grpc::ClientReaderWriter;
+using grpc::Server;
+using grpc::ServerBuilder;
+using grpc::ServerContext;
+using grpc::ServerReaderWriter;
 using grpc::Status;
+using grpc::StatusCode;
 using bidir::BidirService;
 using bidir::Request;
 using bidir::Response;
@@ -32,7 +35,7 @@ std::mutex g_log_mu;
 
 void HandleSignal(int) { g_stop.store(true); }
 
-// Each address runs on its own thread; keep the shared stdout from interleaving.
+// Each stream is handled on its own gRPC sync thread; keep stdout readable.
 void Log(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_log_mu);
     std::cout << line << std::endl;
@@ -59,80 +62,85 @@ void WaitInterval() {
 
 }  // namespace
 
-// One pushing connection per target address.
-class PushClient {
+// This process is the *listener* and the only writer on the stream: it hosts the
+// gRPC server, and every connected client receives a date/time message every
+// 3 seconds.
+class BidirServiceImpl final : public BidirService::Service {
 public:
-    explicit PushClient(const std::string& address)
-        : address_(address),
-          stub_(BidirService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
+    // Note the generated sync signature is ServerReaderWriter<W, R>: the *write*
+    // type comes first, so this writes Response and would read Request.
+    Status Stream(ServerContext* context, ServerReaderWriter<Response, Request>* stream) override {
+        Log("Client connected");
 
-    void Run() {
-        ClientContext context;
-        std::unique_ptr<ClientReaderWriter<Request, Response>> stream = stub_->Stream(&context);
-        Log("[" + address_ + "] Connected, pushing date/time every " + std::to_string(kPushInterval.count()) +
-            "s; press Ctrl-C to stop.");
-
-        // Blocking read/write loop: one blocking Write per interval. Nothing is
-        // ever read, so the listener stays the only reader.
-        Request request;
+        // Blocking read/write loop: one blocking Write per interval. Write returns
+        // false once the client half-closes or goes away, which is how a
+        // disconnect is noticed.
+        Response response;
         int32_t pushed = 0;
-        bool write_failed = false;
         while (!g_stop.load()) {
             WaitInterval();
             if (g_stop.load()) break;
 
             ++pushed;
-            request.set_opcode(Opcode::STATUS);
-            request.set_id(pushed);
-            request.set_payload(FormatTimestamp());
-            request.set_active(true);
-            request.set_value(0.0F);
-            if (!stream->Write(request)) {
-                // Listener went away; Write reports the broken stream.
-                write_failed = true;
+            response.set_opcode(Opcode::STATUS);
+            response.set_id(pushed);
+            response.set_message(FormatTimestamp());
+            response.set_success(true);
+            response.set_result(0.0F);
+            if (!stream->Write(response)) {
                 break;
             }
         }
 
-        stream->WritesDone();
-        Status status = stream->Finish();
-        if (write_failed || !status.ok()) {
-            Log("[" + address_ + "] Stream finished: " + status.error_message());
-        } else {
-            Log("[" + address_ + "] Stream finished: OK");
+        Log("Client disconnected");
+        if (context->IsCancelled()) {
+            return Status(StatusCode::CANCELLED, "Server shutting down");
         }
+        return Status::OK;
     }
-
-private:
-    std::string address_;
-    std::unique_ptr<BidirService::Stub> stub_;
 };
 
-int main(int argc, char** argv) {
-    std::signal(SIGINT, HandleSignal);
-    std::signal(SIGTERM, HandleSignal);
+void RunServer(const std::string& listen_address) {
+    // Block the signals here so the dedicated thread below can wait for them
+    // safely; Shutdown() must not be called from a signal handler.
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
-    std::vector<std::string> addresses;
-    if (argc > 1) {
-        for (int i = 1; i < argc; ++i) {
-            addresses.push_back(argv[i]);
+    BidirServiceImpl service;
+
+    ServerBuilder builder;
+    builder.AddListeningPort(listen_address, grpc::InsecureServerCredentials());
+    builder.RegisterService(&service);
+    std::unique_ptr<Server> server(builder.BuildAndStart());
+    if (server == nullptr) {
+        std::cerr << "Failed to listen on " << listen_address << std::endl;
+        return;
+    }
+
+    std::thread signal_thread([&server, &signals]() {
+        int signal_number = 0;
+        if (sigwait(&signals, &signal_number) == 0) {
+            Log("Received signal " + std::to_string(signal_number) + ", shutting down");
+            // Flag the write loops, then give in-flight RPCs a deadline so
+            // Wait() cannot be held open by a handler.
+            HandleSignal(signal_number);
+            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
         }
-    } else {
-        addresses.push_back("localhost:50051");
-    }
+    });
 
-    std::vector<std::thread> threads;
-    for (const auto& address : addresses) {
-        threads.emplace_back([address]() {
-            PushClient client(address);
-            client.Run();
-        });
-    }
+    std::cout << "Listening on " << listen_address
+              << "; pushing date/time every " << kPushInterval.count() << "s to each client. "
+              << "Ctrl-C to stop." << std::endl;
+    server->Wait();
+    signal_thread.join();
+    std::cout << "Server stopped" << std::endl;
+}
 
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    std::cout << "All streams finished" << std::endl;
+int main(int argc, char** argv) {
+    std::string address = (argc > 1) ? argv[1] : "0.0.0.0:50051";
+    RunServer(address);
     return 0;
 }
