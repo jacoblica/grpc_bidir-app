@@ -7,19 +7,16 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
 
-using grpc::Server;
-using grpc::ServerBuilder;
-using grpc::ServerContext;
-using grpc::ServerReaderWriter;
+using grpc::ClientContext;
+using grpc::ClientReaderWriter;
 using grpc::Status;
-using grpc::StatusCode;
 using bidir::TimePubService;
 using bidir::TimeSubscriber;
 using bidir::TimePublisher;
@@ -35,7 +32,7 @@ std::mutex g_log_mu;
 
 void HandleSignal(int) { g_stop.store(true); }
 
-// Each stream is handled on its own gRPC sync thread; keep stdout readable.
+// Each publisher runs on its own thread; keep the shared stdout from interleaving.
 void Log(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_log_mu);
     std::cout << line << std::endl;
@@ -60,87 +57,123 @@ void WaitInterval() {
     }
 }
 
+// A blocking Write (or Finish) cannot be interrupted by a flag alone. The
+// contexts are registered here so the shutdown thread can cancel them.
+std::mutex g_registry_mu;
+std::vector<ClientContext*> g_contexts;
+
+void RegisterContext(ClientContext* context) {
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    g_contexts.push_back(context);
+}
+
+void UnregisterContext(ClientContext* context) {
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    g_contexts.erase(std::remove(g_contexts.begin(), g_contexts.end(), context), g_contexts.end());
+}
+
+void CancelAllContexts() {
+    std::lock_guard<std::mutex> lk(g_registry_mu);
+    for (ClientContext* context : g_contexts) {
+        context->TryCancel();
+    }
+}
+
 }  // namespace
 
-// This process is the *listener* and the only writer on the stream: it hosts the
-// gRPC server, and every connected client receives a date/time message every
-// 3 seconds.
-class TimePubServiceImpl final : public TimePubService::Service {
+// This process is the *pusher*: it dials the subscriber and is the only writer
+// on the stream, sending a date/time message every 3 seconds.
+class TimePubClient {
 public:
-    // Note the generated sync signature is ServerReaderWriter<W, R>: the *write*
-    // type comes first, so this writes TimePublisher and would read TimeSubscriber.
-    Status Stream(ServerContext* context, ServerReaderWriter<TimePublisher, TimeSubscriber>* stream) override {
-        Log("Client connected");
+    explicit TimePubClient(const std::string& address)
+        : address_(address),
+          stub_(TimePubService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
 
-        // Blocking read/write loop: one blocking Write per interval. Write returns
-        // false once the client half-closes or goes away, which is how a
-        // disconnect is noticed.
-        TimePublisher response;
+    void Run() {
+        ClientContext context;
+        RegisterContext(&context);
+
+        std::unique_ptr<ClientReaderWriter<TimePublisher, TimeSubscriber>> stream = stub_->Stream(&context);
+        Log("[" + address_ + "] Connected, pushing date/time every " + std::to_string(kPushInterval.count()) +
+            "s; press Ctrl-C to stop.");
+
+        // Blocking read/write loop: one blocking Write per interval. Nothing is
+        // ever read, so the subscriber stays the only reader. Write returns
+        // false once the subscriber half-closes or goes away.
+        TimePublisher message;
         int32_t pushed = 0;
+        bool write_failed = false;
         while (!g_stop.load()) {
             WaitInterval();
             if (g_stop.load()) break;
 
             ++pushed;
-            response.set_opcode(Opcode::STATUS);
-            response.set_id(pushed);
-            response.set_message(FormatTimestamp());
-            response.set_success(true);
-            response.set_result(0.0F);
-            if (!stream->Write(response)) {
+            message.set_opcode(Opcode::STATUS);
+            message.set_id(pushed);
+            message.set_message(FormatTimestamp());
+            message.set_success(true);
+            message.set_result(0.0F);
+            if (!stream->Write(message)) {
+                write_failed = true;
                 break;
             }
         }
 
-        Log("Client disconnected");
-        if (context->IsCancelled()) {
-            return Status(StatusCode::CANCELLED, "Server shutting down");
+        stream->WritesDone();
+        Status status = stream->Finish();
+        UnregisterContext(&context);
+        if (write_failed || !status.ok()) {
+            Log("[" + address_ + "] Stream finished: " + status.error_message());
+        } else {
+            Log("[" + address_ + "] Stream finished: OK");
         }
-        return Status::OK;
     }
+
+private:
+    std::string address_;
+    std::unique_ptr<TimePubService::Stub> stub_;
 };
 
-void RunServer(const std::string& listen_address) {
-    // Block the signals here so the dedicated thread below can wait for them
-    // safely; Shutdown() must not be called from a signal handler.
+int main(int argc, char** argv) {
+    // Block the signals so the dedicated thread below can consume them safely.
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
     sigaddset(&signals, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
-    TimePubServiceImpl service;
-
-    ServerBuilder builder;
-    builder.AddListeningPort(listen_address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
-    std::unique_ptr<Server> server(builder.BuildAndStart());
-    if (server == nullptr) {
-        std::cerr << "Failed to listen on " << listen_address << std::endl;
-        return;
-    }
-
-    std::thread signal_thread([&server, &signals]() {
+    std::thread signal_thread([&signals]() {
         int signal_number = 0;
         if (sigwait(&signals, &signal_number) == 0) {
-            Log("Received signal " + std::to_string(signal_number) + ", shutting down");
-            // Flag the write loops, then give in-flight RPCs a deadline so
-            // Wait() cannot be held open by a handler.
+            Log("Received signal " + std::to_string(signal_number) + ", cancelling streams");
             HandleSignal(signal_number);
-            server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+            CancelAllContexts();
         }
     });
+    // Nothing to join: the thread stays parked in sigwait until the process exits.
+    signal_thread.detach();
 
-    std::cout << "Listening on " << listen_address
-              << "; pushing date/time every " << kPushInterval.count() << "s to each client. "
-              << "Ctrl-C to stop." << std::endl;
-    server->Wait();
-    signal_thread.join();
-    std::cout << "Server stopped" << std::endl;
-}
+    std::vector<std::string> addresses;
+    if (argc > 1) {
+        for (int i = 1; i < argc; ++i) {
+            addresses.push_back(argv[i]);
+        }
+    } else {
+        addresses.push_back("localhost:50051");
+    }
 
-int main(int argc, char** argv) {
-    std::string address = (argc > 1) ? argv[1] : "0.0.0.0:50051";
-    RunServer(address);
+    std::vector<std::thread> threads;
+    for (const auto& address : addresses) {
+        threads.emplace_back([address]() {
+            TimePubClient publisher(address);
+            publisher.Run();
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    std::cout << "All streams finished" << std::endl;
     return 0;
 }

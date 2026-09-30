@@ -26,5 +26,5 @@ message TimePublisher {
 }
 
 service TimePubService {
-  rpc Stream(stream TimeSubscriber) returns (stream TimePublisher);
+  rpc Stream(stream TimePublisher) returns (stream TimeSubscriber);
 }

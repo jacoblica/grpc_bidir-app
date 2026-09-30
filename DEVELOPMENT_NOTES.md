@@ -6,26 +6,28 @@
 server is the sole writer: it listens, and every connected client receives a date/time string
 every 3 seconds.
 
-- `service.proto` — defines `TimePubService.Stream` (bidirectional stream) with `TimeSubscriber` (the writing side's request type: `Opcode`, `int32 id`, `bool active`, `float value`) and `TimePublisher` (the server's pushed type: `Opcode`, `int32 id`, `string message`, `bool success`, `float result`).
-- `time_publisher.cpp` — the gRPC **server** ("time publisher"): listens (default `0.0.0.0:50051`), and its stream handler writes a formatted date/time to each connected client every 3 seconds.
-- `time_susbscriber.cpp` — the gRPC **client** ("time subscriber"): connects to one or more servers and only reads.
+- `service.proto` — defines `TimePubService.Stream` (bidirectional stream) with `TimePublisher` (what a publisher writes: `Opcode`, `int32 id`, `string message`, `bool success`, `float result`) and `TimeSubscriber` (what a subscriber would write: `Opcode`, `int32 id`, `bool active`, `float value`).
+- `time_susbscriber.cpp` — the gRPC **server** ("time subscriber"): listens (default `0.0.0.0:50051`) and only receives.
+- `time_publisher.cpp` — the gRPC **client** ("time publisher"): dials one or more subscribers and pushes a formatted date/time string every 3 seconds.
 - `CMakeLists.txt` / `build.sh` — build (protoc codegen + CMake).
 
-Both sides use the **synchronous/blocking API** (`TimePubService::Service::Stream` on the server,
-`Stub::Stream(&context)` returning a `ClientReaderWriter` on the client). There are no reactors.
+Both sides use the **synchronous/blocking API** (`TimePubService::Service::Stream` on the subscriber,
+`Stub::Stream(&context)` returning a `ClientReaderWriter` on the publisher). There are no reactors.
 
 The date/time travels in `TimePublisher.message` (`opcode = STATUS`, `id` = per-connection push
-counter), since the server is the writing side of the stream.
+counter). Because the publisher is the dialing side, the rpc is declared
+`rpc Stream(stream TimePublisher) returns (stream TimeSubscriber)`: a gRPC client can only write the
+rpc's first message type.
 
 ## Build & Run
 
 ```bash
-./build.sh                       # cleans build/, runs cmake + make
-./build/time_publisher 0.0.0.0:50051   # listen address is optional
-./build/time_susbscriber localhost:50051   # accepts any number of publisher addresses
+./build.sh                                # cleans build/, runs cmake + make
+./build/time_susbscriber 0.0.0.0:50051    # listener; listen address is optional
+./build/time_publisher localhost:50051    # pusher; accepts any number of subscriber addresses
 ```
 
-Start the server first, then the client. Either process can be stopped with Ctrl-C.
+Start the subscriber first, then the publisher. Either process can be stopped with Ctrl-C.
 
 ## Session Changes
 
@@ -130,15 +132,33 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
   binaries are `build/time_publisher` and `build/time_susbscriber`.
 - Note the subscriber filename keeps the requested spelling `time_susbscriber` (sic).
 
+### 10. Roles swapped again: subscriber listens, publisher dials and pushes
+
+- `service.proto` now declares `rpc Stream(stream TimePublisher) returns (stream TimeSubscriber)`
+  (was the other way round). A gRPC client can only write the rpc's *first* message type, and
+  `TimeSubscriber` has no string field, so the timestamp needed a type it can actually send.
+- `time_susbscriber.cpp` became the gRPC server: `TimePubServiceImpl::Stream` blocks in
+  `while (stream->Read(&message))` on a `TimePublisher`. Publishers never write, so the read just
+  parks until they half-close or vanish; received lines are tagged with `context->peer()`.
+- `time_publisher.cpp` became the gRPC client: `TimePubClient::Run` blocks in `stream->Write(...)`
+  every 3 seconds, then `WritesDone()` + `Finish()`. `Write() == false` is the disconnect signal.
+- The blocking-API support code moved with the roles: the `ClientContext` registry + `sigwait`
+  thread that cancels streams now lives in the publisher, and the `Shutdown(deadline)` logic in the
+  subscriber.
+- protoc regenerates the handler signature as `ServerReaderWriter<TimeSubscriber, TimePublisher>`
+  (still `<return, request>`), which now matches "read TimePublisher, would write TimeSubscriber".
+
 ## Gotchas / Lessons Learned
 
+- **A gRPC client can only write the rpc's first message type.** If the pushing process is the
+  dialing one, the string-carrying message must be the *request* type, or the rpc signature has to
+  be swapped; check which fields the writing type actually has before putting a payload in it.
 - **Sync bidi handler signature is `ServerReaderWriter<W, R>`, not `<R, W>`.** protoc generates
-  `Service::Stream(ServerContext*, ServerReaderWriter<TimePublisher, TimeSubscriber>*)` for
-  `rpc Stream(stream TimeSubscriber) returns (stream TimePublisher)` — the *write* type is the first template
-  argument, so `Read()` fills a `TimeSubscriber` and `Write()` takes a `TimePublisher`.
-- **Method signatures fix the wire direction.** Swapping who listens and who dials also swaps who
-  writes `TimeSubscriber` and who writes `TimePublisher`; the payload has to live in the message the writing
-  side is allowed to write.
+  `Service::Stream(ServerContext*, ServerReaderWriter<TimeSubscriber, TimePublisher>*)` for
+  `rpc Stream(stream TimePublisher) returns (stream TimeSubscriber)` — the *write* type is the first
+  template argument, so `Read()` fills a `TimePublisher` and `Write()` would take a `TimeSubscriber`.
+- **A blocking `Read` or `Write` needs a cancellation path.** A flag cannot unblock either; register
+  the `ClientContext` and call `TryCancel()` from a `sigwait` thread when Ctrl-C must be graceful.
 - **Client reactors have no operation backlog.** Unlike `ServerBidiReactor`, whose `StartRead`/`StartWrite` queue work even before the stream is bound, `ClientBidiReactor::StartRead` calls `stream_->Read(...)` directly. Calling `StartRead` in the reactor constructor (before `experimental_async()->Stream(...)`) dereferences a null `stream_` and segfaults. Post the first read **after** binding, before `StartCall()`.
 - **`StartCall()` is mandatory** for every client reactor, even if the RPC is cancelled.
 - **Message lifetime:** a message passed to `StartRead`/`StartWrite` must remain valid and unmodified until the corresponding `OnReadDone`/`OnWriteDone` fires. Member buffers are used for this reason.
@@ -159,13 +179,15 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 
 ## Testing Performed
 
-- Built cleanly via `./build.sh`.
-- Server pushes timestamps to a connected client at 3s intervals (`20:07:13`, `20:07:16`, `20:07:19`).
-- Two clients connected at once: each got its own per-connection counter and cadence; the server
-  logged two `Client connected` lines.
-- `SIGKILL`'d both clients mid-stream: the server logged `Client disconnected` and kept serving; a
-  reconnecting client streamed normally.
-- Client against a closed port -> `failed to connect to all addresses`, exit code 0.
-- Ctrl-C on the client -> `Stream finished: CANCELLED` / `All streams finished`; Ctrl-C on the
-  server -> `Received signal 2, shutting down` / `Server stopped`. Both exit code 0.
+- Clean `./build.sh` after the rename/signature swap; protoc regenerated
+  `ServerReaderWriter<TimeSubscriber, TimePublisher>`.
+- Publisher -> subscriber at 3s intervals (`20:30:27`, `20:30:30`), subscriber tagging lines with
+  `context->peer()`.
+- Two publishers at once: both connected, each with its own per-connection counter and cadence.
+- `kill -9` on a publisher: subscriber logged `Time publisher disconnected` and kept serving; a
+  reconnecting publisher streamed normally (`#1 20:30:36`).
+- Ctrl-C on the publisher -> `Stream finished: CANCELLED` / `All streams finished`; Ctrl-C on the
+  subscriber -> `Received signal 2, shutting down` / `Subscriber stopped`. Both exit code 0.
 - Re-ran the whole suite after each role/API change.
+- Note: `pkill -x time_susbscriber` matches nothing (Linux truncates `comm` at 15 chars); use
+  `pkill -f`, and beware that `-f` patterns also match the invoking shell.
