@@ -20,9 +20,9 @@ using grpc::ServerContext;
 using grpc::ServerReaderWriter;
 using grpc::Status;
 using grpc::StatusCode;
-using bidir::BidirService;
-using bidir::Request;
-using bidir::Response;
+using bidir::TimePubService;
+using bidir::TimeSubscriber;
+using bidir::TimePublisher;
 using bidir::Opcode;
 
 namespace {
@@ -65,17 +65,17 @@ void WaitInterval() {
 // This process is the *listener* and the only writer on the stream: it hosts the
 // gRPC server, and every connected client receives a date/time message every
 // 3 seconds.
-class BidirServiceImpl final : public BidirService::Service {
+class TimePubServiceImpl final : public TimePubService::Service {
 public:
     // Note the generated sync signature is ServerReaderWriter<W, R>: the *write*
-    // type comes first, so this writes Response and would read Request.
-    Status Stream(ServerContext* context, ServerReaderWriter<Response, Request>* stream) override {
+    // type comes first, so this writes TimePublisher and would read TimeSubscriber.
+    Status Stream(ServerContext* context, ServerReaderWriter<TimePublisher, TimeSubscriber>* stream) override {
         Log("Client connected");
 
         // Blocking read/write loop: one blocking Write per interval. Write returns
         // false once the client half-closes or goes away, which is how a
         // disconnect is noticed.
-        Response response;
+        TimePublisher response;
         int32_t pushed = 0;
         while (!g_stop.load()) {
             WaitInterval();
@@ -109,7 +109,7 @@ void RunServer(const std::string& listen_address) {
     sigaddset(&signals, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
-    BidirServiceImpl service;
+    TimePubServiceImpl service;
 
     ServerBuilder builder;
     builder.AddListeningPort(listen_address, grpc::InsecureServerCredentials());

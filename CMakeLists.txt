@@ -32,10 +32,10 @@ add_custom_command(
 # Include generated files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
-# Server
-add_executable(server server.cpp ${hw_proto_srcs} ${hw_grpc_srcs})
-target_link_libraries(server ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF} Threads::Threads)
+# Time publisher: listens and pushes the date/time to every connected subscriber
+add_executable(time_publisher time_publisher.cpp ${hw_proto_srcs} ${hw_grpc_srcs})
+target_link_libraries(time_publisher ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF} Threads::Threads)
 
-# Client
-add_executable(client client.cpp ${hw_proto_srcs} ${hw_grpc_srcs})
-target_link_libraries(client ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF} Threads::Threads)
+# Time subscriber: connects to one or more publishers and only receives
+add_executable(time_susbscriber time_susbscriber.cpp ${hw_proto_srcs} ${hw_grpc_srcs})
+target_link_libraries(time_susbscriber ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF} Threads::Threads)

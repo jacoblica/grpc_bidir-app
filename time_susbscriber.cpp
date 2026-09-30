@@ -12,9 +12,9 @@
 using grpc::ClientContext;
 using grpc::ClientReaderWriter;
 using grpc::Status;
-using bidir::BidirService;
-using bidir::Request;
-using bidir::Response;
+using bidir::TimePubService;
+using bidir::TimeSubscriber;
+using bidir::TimePublisher;
 using bidir::Opcode;
 
 namespace {
@@ -57,18 +57,18 @@ class BidirClient {
 public:
     explicit BidirClient(const std::string& address)
         : address_(address),
-          stub_(BidirService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
+          stub_(TimePubService::NewStub(grpc::CreateChannel(address, grpc::InsecureChannelCredentials()))) {}
 
     void Run() {
         ClientContext context;
         RegisterContext(&context);
 
-        std::unique_ptr<ClientReaderWriter<Request, Response>> stream = stub_->Stream(&context);
+        std::unique_ptr<ClientReaderWriter<TimeSubscriber, TimePublisher>> stream = stub_->Stream(&context);
         Log("[" + address_ + "] Connected, receiving date/time; press Ctrl-C to stop.");
 
         // Blocking read/write loop: one blocking Read per pushed message. Read
         // returns false when the server ends the stream or the call is cancelled.
-        Response response;
+        TimePublisher response;
         while (stream->Read(&response)) {
             Log("[" + address_ + "] #" + std::to_string(response.id()) + " " + response.message());
         }
@@ -80,7 +80,7 @@ public:
 
 private:
     std::string address_;
-    std::unique_ptr<BidirService::Stub> stub_;
+    std::unique_ptr<TimePubService::Stub> stub_;
 };
 
 int main(int argc, char** argv) {

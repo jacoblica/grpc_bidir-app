@@ -6,23 +6,23 @@
 server is the sole writer: it listens, and every connected client receives a date/time string
 every 3 seconds.
 
-- `service.proto` — defines `BidirService.Stream` (bidirectional stream) plus `Request`/`Response` messages. Each message has 5 fields: `Opcode` enum, `int32`, `string`, `bool`, `float`.
-- `server.cpp` — the gRPC **server**: listens (default `0.0.0.0:50051`), and its stream handler writes a formatted date/time to each connected client every 3 seconds.
-- `client.cpp` — the gRPC **client**: connects to one or more servers and only reads.
+- `service.proto` — defines `TimePubService.Stream` (bidirectional stream) with `TimeSubscriber` (the writing side's request type: `Opcode`, `int32 id`, `bool active`, `float value`) and `TimePublisher` (the server's pushed type: `Opcode`, `int32 id`, `string message`, `bool success`, `float result`).
+- `time_publisher.cpp` — the gRPC **server** ("time publisher"): listens (default `0.0.0.0:50051`), and its stream handler writes a formatted date/time to each connected client every 3 seconds.
+- `time_susbscriber.cpp` — the gRPC **client** ("time subscriber"): connects to one or more servers and only reads.
 - `CMakeLists.txt` / `build.sh` — build (protoc codegen + CMake).
 
-Both sides use the **synchronous/blocking API** (`BidirService::Service::Stream` on the server,
+Both sides use the **synchronous/blocking API** (`TimePubService::Service::Stream` on the server,
 `Stub::Stream(&context)` returning a `ClientReaderWriter` on the client). There are no reactors.
 
-The date/time travels in `Response.message` (`opcode = STATUS`, `id` = per-connection push counter),
-since the server is the writing side of the stream.
+The date/time travels in `TimePublisher.message` (`opcode = STATUS`, `id` = per-connection push
+counter), since the server is the writing side of the stream.
 
 ## Build & Run
 
 ```bash
 ./build.sh                       # cleans build/, runs cmake + make
-./build/server 0.0.0.0:50051     # listener/pusher; listen address is optional
-./build/client localhost:50051   # receiver; accepts any number of server addresses
+./build/time_publisher 0.0.0.0:50051   # listen address is optional
+./build/time_susbscriber localhost:50051   # accepts any number of publisher addresses
 ```
 
 Start the server first, then the client. Either process can be stopped with Ctrl-C.
@@ -44,19 +44,19 @@ Start the server first, then the client. Either process can be stopped with Ctrl
 
 (Superseded by change 6; kept for history. Both sides now use the blocking API again.)
 
-Previously both sides used the blocking/synchronous API (client `stub_->Stream(&context)` on a thread; server overriding `BidirService::Service::Stream`).
+Previously both sides used the blocking/synchronous API (client `stub_->Stream(&context)` on a thread; server overriding `TimePubService::Service::Stream`).
 
 **Listener (gRPC server role)**
 
-- `BidirServiceImpl` derives from `BidirService::CallbackService` and overrides
-  `Stream(CallbackServerContext*)`, returning a heap-allocated `ServerBidiReactor<Request, Response>`.
+- `TimePubServiceImpl` derives from `TimePubService::CallbackService` and overrides
+  `Stream(CallbackServerContext*)`, returning a heap-allocated `ServerBidiReactor<TimeSubscriber, TimePublisher>`.
 - `StreamReactor` flow: `StartRead` -> `OnReadDone` (print the pushed date/time) -> `StartRead`.
 - `Finish(Status::OK)` when the push source half-closes (`ok == false` on read); `OnCancel` finishes
   with `CANCELLED`; `OnDone` deletes the reactor. A `finished_` flag guards against a double `Finish`.
 
 **Pusher (gRPC client role)**
 
-- Heap-allocated `ClientBidiReactor<Request, Response>`, bound with
+- Heap-allocated `ClientBidiReactor<TimeSubscriber, TimePublisher>`, bound with
   `stub->experimental_async()->Stream(context, reactor)` followed by `StartCall()`.
 - `OnReadDone` re-arms `StartRead` (the listener never writes, so the read only detects the end of
   the stream); `OnDone` reports status and signals the waiting caller.
@@ -80,7 +80,7 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 ### 5. Roles swapped: client listens, server connects
 
 - `client.cpp` is now the gRPC server (`ServerBuilder` + `CallbackService`); `server.cpp` is now the
-  gRPC client (`BidirService::Stub` + `ClientBidiReactor`).
+  gRPC client (`TimePubService::Stub` + `ClientBidiReactor`).
 - The timestamp moved from `Response.message` to `Request.payload`, because the pushing process is
   the gRPC client and can therefore only write `Request` messages.
 - The listener prints `Push source connected` / `Push source disconnected` per stream and supports
@@ -89,10 +89,10 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 
 ### 6. Back to the synchronous/blocking API
 
-- `server.cpp` (listener) derives from `BidirService::Service` and implements
-  `Status Stream(ServerContext*, ServerReaderWriter<Response, Request>*)` with a blocking
+- `time_publisher.cpp` (listener) derives from `TimePubService::Service` and implements
+  `Status Stream(ServerContext*, ServerReaderWriter<TimePublisher, TimeSubscriber>*)` with a blocking
   `while (stream->Read(&request))` loop. Each stream is served on its own gRPC sync thread.
-- `client.cpp` (pusher) uses `stub_->Stream(&context)`; the loop is a blocking `stream->Write(...)`
+- `time_susbscriber.cpp` (pusher) uses `stub_->Stream(&context)`; the loop is a blocking `stream->Write(...)`
   every 3 seconds, then `WritesDone()` + `Finish()`. No reactor, no per-connection ticker thread.
 - `WaitInterval()` sleeps the 3s interval in 200ms slices, because a signal handler cannot touch the
   mutex/condition variable that a `cv_.wait_for` would need; Ctrl-C is therefore honoured within
@@ -104,25 +104,40 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 
 ### 7. Server listens, server pushes; client connects and receives
 
-- `server.cpp` is the gRPC server *and* the only writer: its handler runs a blocking
-  `stream->Write(response)` every 3 seconds (`Response.message` = timestamp, `id` = per-connection
+- `time_publisher.cpp` is the gRPC server *and* the only writer: its handler runs a blocking
+  `stream->Write(response)` every 3 seconds (`TimePublisher.message` = timestamp, `id` = per-connection
   counter) and treats `Write() == false` as the disconnect signal, since the handler never reads.
   A client half-close is therefore noticed within one interval.
-- `client.cpp` is a pure reader: `while (stream->Read(&response))` + `Finish()`.
+- `time_susbscriber.cpp` is a pure reader: `while (stream->Read(&response))` + `Finish()`.
 - A blocking `Read` cannot be interrupted by a flag, so the client keeps a small registry of active
   `ClientContext`s; a `sigwait` thread cancels all of them on SIGINT/SIGTERM, which unblocks the
   pending `Read` and lets `Finish()` report `CANCELLED`.
 - The server's `sigwait` thread sets `g_stop` (so the handler's interval wait returns early) and
   then calls `Shutdown(deadline)`.
 
+### 8. Proto renames: `BidirService` -> `TimePubService`, `Request`/`Response` -> `TimeSubscriber`/`TimePublisher`
+
+- `service.proto` now defines `TimePubService.Stream(stream TimeSubscriber) returns (stream TimePublisher)`.
+- `TimeSubscriber` dropped its `string payload` field (it is the type only the writing side would
+  send, and the server never sends one), keeping `opcode`/`id`/`active`/`value`.
+- Both sources updated to the new names; the wire behaviour is unchanged. Sections 3-7 above refer
+  to the old `BidirService`/`Request`/`Response` names and describe superseded states.
+
+### 9. File/binary renames
+
+- `client.cpp` -> `time_susbscriber.cpp` (gRPC client / subscriber), `server.cpp` ->
+  `time_publisher.cpp` (gRPC server / publisher). `CMakeLists.txt` targets renamed to match, so the
+  binaries are `build/time_publisher` and `build/time_susbscriber`.
+- Note the subscriber filename keeps the requested spelling `time_susbscriber` (sic).
+
 ## Gotchas / Lessons Learned
 
 - **Sync bidi handler signature is `ServerReaderWriter<W, R>`, not `<R, W>`.** protoc generates
-  `Service::Stream(ServerContext*, ServerReaderWriter<Response, Request>*)` for
-  `rpc Stream(stream Request) returns (stream Response)` — the *write* type is the first template
-  argument, so `Read()` fills a `Request` and `Write()` takes a `Response`.
+  `Service::Stream(ServerContext*, ServerReaderWriter<TimePublisher, TimeSubscriber>*)` for
+  `rpc Stream(stream TimeSubscriber) returns (stream TimePublisher)` — the *write* type is the first template
+  argument, so `Read()` fills a `TimeSubscriber` and `Write()` takes a `TimePublisher`.
 - **Method signatures fix the wire direction.** Swapping who listens and who dials also swaps who
-  writes `Request` and who writes `Response`; the payload has to live in the message the writing
+  writes `TimeSubscriber` and who writes `TimePublisher`; the payload has to live in the message the writing
   side is allowed to write.
 - **Client reactors have no operation backlog.** Unlike `ServerBidiReactor`, whose `StartRead`/`StartWrite` queue work even before the stream is bound, `ClientBidiReactor::StartRead` calls `stream_->Read(...)` directly. Calling `StartRead` in the reactor constructor (before `experimental_async()->Stream(...)`) dereferences a null `stream_` and segfaults. Post the first read **after** binding, before `StartCall()`.
 - **`StartCall()` is mandatory** for every client reactor, even if the RPC is cancelled.
@@ -140,7 +155,7 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 - **`Server::Shutdown()` without a deadline waits for in-flight RPCs**, so a handler parked in
   `Read` would keep `Wait()` blocked until the client left on its own.
 - Interleaved stdout from concurrent handler/client threads is expected; `Log()` serializes it.
-- Not used but available: completion-queue async (`BidirService::AsyncService::RequestStream`).
+- Not used but available: completion-queue async (`TimePubService::AsyncService::RequestStream`).
 
 ## Testing Performed
 

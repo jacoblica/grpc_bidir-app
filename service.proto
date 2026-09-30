@@ -10,15 +10,14 @@ enum Opcode {
   CLOSE = 4;
 }
 
-message Request {
+message TimeSubscriber {
   Opcode opcode = 1;
   int32 id = 2;
-  string payload = 3;
-  bool active = 4;
+  bool active = 3;
   float value = 5;
 }
 
-message Response {
+message TimePublisher {
   Opcode opcode = 1;
   int32 id = 2;
   string message = 3;
@@ -26,6 +25,6 @@ message Response {
   float result = 5;
 }
 
-service BidirService {
-  rpc Stream(stream Request) returns (stream Response);
+service TimePubService {
+  rpc Stream(stream TimeSubscriber) returns (stream TimePublisher);
 }
