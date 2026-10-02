@@ -43,11 +43,23 @@ constexpr auto kRetryInitial = std::chrono::milliseconds(1000);
 constexpr auto kRetryMax = std::chrono::milliseconds(15000);
 constexpr int kMaxBackoffShift = 4;
 
-// Keepalive bounds how long a silently dropped network stays unnoticed. Without
-// it the blocking Write below just waits on a dead TCP connection (minutes)
-// instead of failing the stream and letting the retry loop reconnect.
-constexpr int kKeepAliveTimeMs = 5000;
-constexpr int kKeepAliveTimeoutMs = 3000;
+// Keepalive bounds how long a silently dropped network stays unnoticed: without
+// it the blocking Write below simply waits on a dead TCP connection until the
+// OS gives up (minutes), instead of failing the stream so the retry loop can
+// reconnect.
+//
+// This interval cannot be made aggressive. gRPC resets the keepalive timer only
+// when *incoming* bytes arrive, and this publisher never receives anything (the
+// subscriber never writes), so pushing date/time every kPushInterval does not
+// postpone anything: a ping goes out every kKeepAliveTimeMs regardless. A ping
+// every few seconds also collides with the ping/BDP traffic our own 3s pushes
+// generate, and a stock gRPC server keeps its own ping-strike policy
+// (grpc.http2.max_ping_strikes, 2 by default). Together those turned a
+// perfectly healthy stream into "keepalive watchdog timeout" every ~15s.
+// Keeping the ping cadence an order of magnitude above the push cadence makes
+// it reliable; the price is the detection budget below.
+constexpr int kKeepAliveTimeMs = 30000;
+constexpr int kKeepAliveTimeoutMs = 10000;
 
 std::atomic<bool> g_stop{false};
 std::mutex g_log_mu;
@@ -99,8 +111,8 @@ std::shared_ptr<Channel> CreateChannel(const std::string& address) {
     ChannelArguments args;
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepAliveTimeMs);
     args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepAliveTimeoutMs);
-    // Date/time only travels every kPushInterval, so allow keepalive pings in
-    // between instead of having the peer count them as ping abuse.
+    // 0 = unlimited pings between data frames, so a peer that does count them
+    // never answers our heartbeat with a GOAWAY.
     args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
     args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, static_cast<int>(kRetryInitial.count()));
     args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, static_cast<int>(kRetryInitial.count()));
@@ -256,9 +268,10 @@ private:
         if (g_stop.load()) {
             Log("[" + address_ + "] Stream finished: " + status.error_message());
         } else {
-            // Either the write failed (peer gone, or keepalive reaped a dead
-            // network) or the subscriber half-closed between two pushes. Both
-            // mean the same thing here: the stream is gone, reconnect.
+            // Either the write failed (peer gone, or keepalive reaped a network
+            // that went silent for kKeepAliveTimeMs + kKeepAliveTimeoutMs) or the
+            // subscriber half-closed between two pushes. Both mean the same thing
+            // here: the stream is gone, reconnect.
             Log("[" + address_ + "] " + (write_failed ? "Connection lost" : "Stream closed") + ": " +
                 std::to_string(status.error_code()) + " " + status.error_message());
         }

@@ -156,9 +156,11 @@ retry loop around a single attempt (`PushOnce`) and only returns once `g_stop` i
 - **Failure detection in three places.** (a) *Subscriber unreachable*: the channel is polled via
   `GetState`/`WaitForStateChange` until `GRPC_CHANNEL_READY` or a `kConnectTimeout` budget runs out.
   (b) *Connection lost*: the blocking `stream->Write` returns false, or `Finish` reports a non-OK status.
-  (c) *Network lost*: `GRPC_ARG_KEEPALIVE_TIME_MS`/`GRPC_ARG_KEEPALIVE_TIMEOUT_MS` (5s/3s) let gRPC reap a
+  (c) *Network lost*: `GRPC_ARG_KEEPALIVE_TIME_MS`/`GRPC_ARG_KEEPALIVE_TIMEOUT_MS` (30s/10s) let gRPC reap a
   silently dead transport, which fails the blocking `Write` with `UNAVAILABLE keepalive watchdog timeout`
-  instead of hanging on a dead TCP connection for minutes.
+  instead of hanging on a dead TCP connection for minutes. 30s/10s is deliberately conservative — see
+  gotcha "the keepalive timer is reset by *incoming* bytes only" below; the detection budget is
+  `kKeepAliveTimeMs + kKeepAliveTimeoutMs` = 40s.
 - **Backoff** is `BackoffDelay(consecutive_failures)`: jittered exponential from `kRetryInitial` (1s),
   doubling up to `kRetryMax` (15s). The generator is a `thread_local std::mt19937` because each publisher
   retries on its own thread. A stream that came up at least once resets the counter, so a recovered
@@ -203,6 +205,21 @@ retry loop around a single attempt (`PushOnce`) and only returns once `g_stop` i
   for local shutdown. If the peer's network dies silently the kernel keeps ACKing the TCP connection, so `Write`
   blocks indefinitely; HTTP/2 keepalive (`GRPC_ARG_KEEPALIVE_TIME_MS` + `GRPC_ARG_KEEPALIVE_TIMEOUT_MS`) is
   what turns that into a failed RPC that can be retried.
+- **The keepalive timer is reset by *incoming* bytes only, so a write-only publisher pings on schedule.**
+  In `chttp2_transport.cc` the timer is reset in the read path ("Since we have read a byte, reset the
+  keepalive timer") and after a ping/BDP ping completes — never by our own outgoing DATA frames. Since
+  `time_publisher.cpp` is the sole writer and the subscriber never writes, the connection receives nothing,
+  so a ping is emitted every `GRPC_ARG_KEEPALIVE_TIME_MS` however often date/time is pushed. Pushing faster
+  does **not** suppress keepalives.
+- **An aggressive client keepalive tears down a perfectly healthy stream.** At 5s/3s this demo killed a live
+  connection every ~15s with `UNAVAILABLE keepalive watchdog timeout`: a ping went out, no ACK arrived within
+  3s, and `keepalive_watchdog_fired_locked` closed the transport (`GRPC_TRACE=http_keepalive` shows
+  `Start keepalive ping` then `Keepalive watchdog fired` exactly `keepalive_timeout` later). A few-second
+  cadence also runs into the peer side: a stock server's strike policy is `max_ping_strikes = 2` and
+  `min_recv_ping_interval_without_data_ms = 300000` (5 min) — `frame_ping.cc` strikes any ping that arrives
+  sooner, and strikes are only reset by `grpc_chttp2_reset_ping_clock` at stream close. Measured: 5s/3s died
+  at ~15s; 20s/10s and 60s/10s stayed clean over 150s. Keep the ping cadence an order of magnitude above the
+  push cadence and re-measure before tightening it.
 - **Channel args need `grpc::CreateCustomChannel`.** `grpc::CreateChannel` has no `ChannelArguments`
   overload, so keepalive/reconnect tuning is a compile error until the custom variant is used.
 - **`Channel::WaitForStateChange` only accepts `std::chrono::system_clock::time_point`** (or `gpr_timespec`);
@@ -232,9 +249,18 @@ retry loop around a single attempt (`PushOnce`) and only returns once `g_stop` i
   timeout` (14 = UNAVAILABLE), retried, and after the subscriber was restarted: `Connection recovered after 1
   failed attempt(s), resuming date/time at #6` -> subscriber received `#6`, `#7`, `#8` on a new peer port. The
   id counter continuing proves the resume, not a new stream.
-- **Network lost:** `kill -STOP` on the subscriber (link up, no traffic). Detected within the 5s+3s keepalive
-  budget, retried through `TRANSIENT_FAILURE` while the peer was frozen, and recovered on `kill -CONT` ->
-  `Connection recovered after 4 failed attempt(s), resuming date/time at #11`.
+- **Network lost:** `kill -STOP` on the subscriber (link up, no traffic). Detected within the
+  `kKeepAliveTimeMs + kKeepAliveTimeoutMs` budget, retried through `TRANSIENT_FAILURE` while the peer was
+  frozen, and recovered on `kill -CONT` -> `Connection recovered after N failed attempt(s), resuming
+  date/time at #<n>`.
+- **Spurious `Connection lost: 14 keepalive watchdog timeout` (regression, caused by 5s/3s keepalive):**
+  reproduced every ~15s on an idle-but-healthy connection. Fixed by raising the keepalive to 30s/10s; a
+  600s soak (200 pushes, ~20 pings) logged **zero** `Connection lost`/`Retrying`/`not reachable` lines and
+  zero subscriber-side disconnects, and the `kill -STOP` case still recovered.
+- Keepalive parameter sweep (experimental harness, env-configurable, `grpc.keepalive_*` + trace
+  `http_keepalive`): 5s/3s fails at ~15s; `GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA` of 0 vs the default 2 makes
+  no difference; 20s/10s and 60s/10s clean over 150s; no `GRPC_ARG_TCP_USER_TIMEOUT` / TCP keepalive args
+  exist in gRPC 1.51.1, so HTTP/2 keepalive is the only bounded dead-peer mechanism available here.
 - **Multiple addresses:** publisher dialing one live and one dead port kept pushing on the live one while the
   dead one retried independently; Ctrl-C stopped both (`All streams finished`, exit code 0).
 - **Ctrl-C during the retry loop** (no subscriber, no registered context) exited promptly with code 0.
