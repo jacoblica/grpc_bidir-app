@@ -148,6 +148,33 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
 - protoc regenerates the handler signature as `ServerReaderWriter<TimeSubscriber, TimePublisher>`
   (still `<return, request>`), which now matches "read TimePublisher, would write TimeSubscriber".
 
+### 11. Publisher retry and connection recovery
+
+`time_publisher.cpp` no longer exits when a subscriber is missing or a stream dies. `TimePubClient::Run` is now a
+retry loop around a single attempt (`PushOnce`) and only returns once `g_stop` is set.
+
+- **Failure detection in three places.** (a) *Subscriber unreachable*: the channel is polled via
+  `GetState`/`WaitForStateChange` until `GRPC_CHANNEL_READY` or a `kConnectTimeout` budget runs out.
+  (b) *Connection lost*: the blocking `stream->Write` returns false, or `Finish` reports a non-OK status.
+  (c) *Network lost*: `GRPC_ARG_KEEPALIVE_TIME_MS`/`GRPC_ARG_KEEPALIVE_TIMEOUT_MS` (5s/3s) let gRPC reap a
+  silently dead transport, which fails the blocking `Write` with `UNAVAILABLE keepalive watchdog timeout`
+  instead of hanging on a dead TCP connection for minutes.
+- **Backoff** is `BackoffDelay(consecutive_failures)`: jittered exponential from `kRetryInitial` (1s),
+  doubling up to `kRetryMax` (15s). The generator is a `thread_local std::mt19937` because each publisher
+  retries on its own thread. A stream that came up at least once resets the counter, so a recovered
+  connection is retried within ~1s instead of after the grown penalty.
+- **A fresh channel per attempt** (`CreateChannel`), via `grpc::CreateCustomChannel` because only that
+  overload takes `ChannelArguments`. A new subscriber process or a restored link is then redialled
+  immediately instead of waiting out the backoff of a channel that already gave up;
+  `GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS`/`MIN`/`MAX` are shortened to match.
+- **Resume, not restart**: `pushed_` moved into the class and survives reconnects, so the resumed stream
+  logs `Connection recovered after N failed attempt(s), resuming date/time at #<n>` and the subscriber can
+  see it is the same publisher.
+- `WaitInterval()` became `WaitInterruptible(duration)` and now also serves as the retry wait, so Ctrl-C is
+  honoured both while pushing and while backing off.
+- Unchanged: one `ClientContext` per attempt, registered/unregistered around the stream so the `sigwait`
+  thread can still cancel an in-flight blocking `Write`; the signal path still exits with code 0.
+
 ## Gotchas / Lessons Learned
 
 - **A gRPC client can only write the rpc's first message type.** If the pushing process is the
@@ -172,6 +199,16 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
   first read must still be posted after binding.
 - **A blocking `Read` needs a cancellation path.** A flag cannot unblock it; register the
   `ClientContext` and call `TryCancel()` from a `sigwait` thread when Ctrl-C must be graceful.
+- **A blocking `Write` also needs a liveness timeout, not just a cancellation path.** Cancellation only helps
+  for local shutdown. If the peer's network dies silently the kernel keeps ACKing the TCP connection, so `Write`
+  blocks indefinitely; HTTP/2 keepalive (`GRPC_ARG_KEEPALIVE_TIME_MS` + `GRPC_ARG_KEEPALIVE_TIMEOUT_MS`) is
+  what turns that into a failed RPC that can be retried.
+- **Channel args need `grpc::CreateCustomChannel`.** `grpc::CreateChannel` has no `ChannelArguments`
+  overload, so keepalive/reconnect tuning is a compile error until the custom variant is used.
+- **`Channel::WaitForStateChange` only accepts `std::chrono::system_clock::time_point`** (or `gpr_timespec`);
+  a `steady_clock` deadline does not compile.
+- **An unreachable channel loops IDLE/CONNECTING/TRANSIENT_FAILURE internally.** Logging every transition
+  floods stdout (gRPC re-dials within a single attempt); log the final verdict only.
 - **`Server::Shutdown()` without a deadline waits for in-flight RPCs**, so a handler parked in
   `Read` would keep `Wait()` blocked until the client left on its own.
 - Interleaved stdout from concurrent handler/client threads is expected; `Log()` serializes it.
@@ -188,6 +225,22 @@ Previously both sides used the blocking/synchronous API (client `stub_->Stream(&
   reconnecting publisher streamed normally (`#1 20:30:36`).
 - Ctrl-C on the publisher -> `Stream finished: CANCELLED` / `All streams finished`; Ctrl-C on the
   subscriber -> `Received signal 2, shutting down` / `Subscriber stopped`. Both exit code 0.
+- **Retry: subscriber started late.** Publisher alone logged `localhost:50051 not reachable, channel state
+  TRANSIENT_FAILURE` / `Retrying in 625ms` / `Retrying in 3622ms` (backoff growing), then `Connected` and
+  pushed `#1`, `#2` as soon as the subscriber came up.
+- **Retry: `kill -9` on the subscriber mid-stream.** Publisher logged `Connection lost: 14 keepalive watchdog
+  timeout` (14 = UNAVAILABLE), retried, and after the subscriber was restarted: `Connection recovered after 1
+  failed attempt(s), resuming date/time at #6` -> subscriber received `#6`, `#7`, `#8` on a new peer port. The
+  id counter continuing proves the resume, not a new stream.
+- **Network lost:** `kill -STOP` on the subscriber (link up, no traffic). Detected within the 5s+3s keepalive
+  budget, retried through `TRANSIENT_FAILURE` while the peer was frozen, and recovered on `kill -CONT` ->
+  `Connection recovered after 4 failed attempt(s), resuming date/time at #11`.
+- **Multiple addresses:** publisher dialing one live and one dead port kept pushing on the live one while the
+  dead one retried independently; Ctrl-C stopped both (`All streams finished`, exit code 0).
+- **Ctrl-C during the retry loop** (no subscriber, no registered context) exited promptly with code 0.
+- clang-tidy: no new *kinds* of `readability-identifier-naming` violation; the new identifiers follow the
+  file's existing Google-style conventions (`kXxx` constants, `PascalCase` functions), which the
+  `.clang-tidy` config disagrees with for pre-existing code as well.
 - Re-ran the whole suite after each role/API change.
 - Note: `pkill -x time_susbscriber` matches nothing (Linux truncates `comm` at 15 chars); use
   `pkill -f`, and beware that `-f` patterns also match the invoking shell.
