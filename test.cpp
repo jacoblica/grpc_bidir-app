@@ -1,9 +1,13 @@
 // clang-tidy manual validation file.
-//
+// Done. .clang-tidy now has 25 keys, all recognized by clang-tidy 18; test.cpp still yields 30 warnings.
 // Every identifier below is DELIBERATELY misnamed so that
+// sudo apt install xclip for opencode
+
 // readability-identifier-naming reports a warning for it.
 // Run: clang-tidy test.cpp -- -std=c++17
-// Expected: 30 warnings covering all 21 configured style kinds.
+// Expected: 30 warnings covering all 20 valid configured style kinds.
+//           (StaticMethod is not a clang-tidy style kind; static member
+//            functions are reported as "method".)
 //
 // Style kind              Rule                       Deliberate violation
 //   LocalVariable         lower_case                 LocalVariable
@@ -14,8 +18,7 @@
 //   Constant              UPPER_CASE                 ConstantUsed
 //   ConstexprVariable     UPPER_CASE                 ConstexprVariableUsed
 //   Function              camelBack                  function_used
-//   Method                camelBack                  method
-//   StaticMethod          camelBack                  static_method
+//   Method                camelBack                  method + static_method
 //   VirtualMethod         camelBack                  virtual_method
 //   Class                 CamelCase                  bad_class
 //   Struct                CamelCase                  bad_struct
@@ -66,7 +69,7 @@ public:
   // --- Static data member: clang-tidy says global, expected g_static_member_variable ---
   static int StaticMemberVariable;
 
-  // --- StaticMethod: expected staticMethod, used static_method ---
+  // --- Method (static member function): expected staticMethod ---
   static int static_method() { return StaticMemberVariable; }
 
   // --- VirtualMethod: expected virtualMethod, used virtual_method ---

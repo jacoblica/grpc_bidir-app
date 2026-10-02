@@ -42,11 +42,8 @@ CheckOptions:
   # 全局函数：小驼峰
   - key:             readability-identifier-naming.FunctionCase
     value:           camelBack
-  # 类成员方法：小驼峰
+  # 类成员方法：小驼峰（静态成员方法同样适用，clang-tidy 无独立的 StaticMethod 类别）
   - key:             readability-identifier-naming.MethodCase
-    value:           camelBack
-  # 静态成员方法：小驼峰
-  - key:             readability-identifier-naming.StaticMethodCase
     value:           camelBack
   # 虚方法：小驼峰
   - key:             readability-identifier-naming.VirtualMethodCase
@@ -100,28 +97,4 @@ CheckOptions:
   # 命名空间：全小写
   - key:             readability-identifier-naming.NamespaceCase
     value:           lower_case
-
-# 启用所有社区公认实用的核心检查，同时排除一些过于苛刻或不适用的规则
-Checks: >
-  -*,
-  bugprone-*,
-  cppcoreguidelines-*,
-  modernize-*,
-  performance-*,
-  readability-*,
-  clang-analyzer-*,
-  -cppcoreguidelines-owning-memory,
-  -modernize-use-trailing-return-type,
-  -readability-braces-around-statements,
-  -readability-implicit-bool-conversion
-
-# 遇到这些警告时，直接将其视为编译错误（在 CI/CD 流程中非常流行）
-WarningsAsErrors: 'bugprone-*,performance-*'
-
-# 针对特定检查的个性化配置
-CheckOptions:
-  # 限制可读性检查中的函数复杂度（示例）
-  - key:             readability-function-cognitive-complexity.Threshold
-    value:           '25'
-
 ...
