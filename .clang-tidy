@@ -1,0 +1,127 @@
+---
+# 启用 readability-identifier-naming 检查
+Checks: 'readability-identifier-naming'
+
+HeaderFilterRegex: '.*'
+
+CheckOptions:
+  # ==========================================
+  # 1. 变量与常量命名 (Variables & Constants)
+  # ==========================================
+  # 局部变量：小写蛇形
+  - key:             readability-identifier-naming.LocalVariableCase
+    value:           lower_case
+  # 函数参数：小写蛇形
+  - key:             readability-identifier-naming.ParameterCase
+    value:           lower_case
+  # 全局变量：小写蛇形，带 "g_" 前缀
+  - key:             readability-identifier-naming.GlobalVariableCase
+    value:           lower_case
+  - key:             readability-identifier-naming.GlobalVariablePrefix
+    value:           g_
+  # 静态变量：小写蛇形，带 "s_" 前缀
+  - key:             readability-identifier-naming.StaticVariableCase
+    value:           lower_case
+  - key:             readability-identifier-naming.StaticVariablePrefix
+    value:           s_
+  # 成员变量（类/结构体）：小写蛇形，带 "_" 后缀（避免与局部变量冲突）
+  - key:             readability-identifier-naming.MemberCase
+    value:           lower_case
+  - key:             readability-identifier-naming.MemberSuffix
+    value:           _
+  # 常量（包含局部/全局/静态）：全大写蛇形
+  - key:             readability-identifier-naming.ConstantCase
+    value:           UPPER_CASE
+  # constexpr 变量：全大写蛇形
+  - key:             readability-identifier-naming.ConstexprVariableCase
+    value:           UPPER_CASE
+
+  # ==========================================
+  # 2. 函数与方法命名 (Functions & Methods)
+  # ==========================================
+  # 全局函数：小驼峰
+  - key:             readability-identifier-naming.FunctionCase
+    value:           camelBack
+  # 类成员方法：小驼峰
+  - key:             readability-identifier-naming.MethodCase
+    value:           camelBack
+  # 静态成员方法：小驼峰
+  - key:             readability-identifier-naming.StaticMethodCase
+    value:           camelBack
+  # 虚方法：小驼峰
+  - key:             readability-identifier-naming.VirtualMethodCase
+    value:           camelBack
+
+  # ==========================================
+  # 3. 类型与用户定义结构 (Types & User-defined)
+  # ==========================================
+  # 类名 (Class)：大驼峰（帕斯卡）
+  - key:             readability-identifier-naming.ClassCase
+    value:           CamelCase
+  # 结构体名 (Struct)：大驼峰（帕斯卡）
+  - key:             readability-identifier-naming.StructCase
+    value:           CamelCase
+  # 联合体名 (Union)：大驼峰
+  - key:             readability-identifier-naming.UnionCase
+    value:           CamelCase
+  # 别名 (typedef / using)：大驼峰，带 "Type" 后缀
+  - key:             readability-identifier-naming.TypedefCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TypedefSuffix
+    value:           Type
+  - key:             readability-identifier-naming.TypeAliasCase
+    value:           CamelCase
+  - key:             readability-identifier-naming.TypeAliasSuffix
+    value:           Type
+
+  # ==========================================
+  # 4. 枚举命名 (Enums)
+  # ==========================================
+  # 枚举类型名：大驼峰
+  - key:             readability-identifier-naming.EnumCase
+    value:           CamelCase
+  # 枚举常量值（项）：全大写蛇形
+  - key:             readability-identifier-naming.EnumConstantCase
+    value:           UPPER_CASE
+
+  # ==========================================
+  # 5. 模板与宏 (Templates & Macros)
+  # ==========================================
+  # 模板类型参数 (如 template <typename T>)：全大写，一般为单字母
+  - key:             readability-identifier-naming.TypeTemplateParameterCase
+    value:           UPPER_CASE
+  # 预处理宏定义：全大写蛇形
+  - key:             readability-identifier-naming.MacroDefinitionCase
+    value:           UPPER_CASE
+
+  # ==========================================
+  # 6. 命名空间命名 (Namespaces)
+  # ==========================================
+  # 命名空间：全小写
+  - key:             readability-identifier-naming.NamespaceCase
+    value:           lower_case
+
+# 启用所有社区公认实用的核心检查，同时排除一些过于苛刻或不适用的规则
+Checks: >
+  -*,
+  bugprone-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  clang-analyzer-*,
+  -cppcoreguidelines-owning-memory,
+  -modernize-use-trailing-return-type,
+  -readability-braces-around-statements,
+  -readability-implicit-bool-conversion
+
+# 遇到这些警告时，直接将其视为编译错误（在 CI/CD 流程中非常流行）
+WarningsAsErrors: 'bugprone-*,performance-*'
+
+# 针对特定检查的个性化配置
+CheckOptions:
+  # 限制可读性检查中的函数复杂度（示例）
+  - key:             readability-function-cognitive-complexity.Threshold
+    value:           '25'
+
+...
