@@ -28,20 +28,20 @@ using bidir::Opcode;
 
 namespace {
 
-constexpr auto kPushInterval = std::chrono::seconds(3);
-constexpr auto kSleepSlice = std::chrono::milliseconds(200);
+constexpr auto K_PUSH_INTERVAL = std::chrono::seconds(3);
+constexpr auto K_SLEEP_SLICE = std::chrono::milliseconds(200);
 
 // One connection attempt may not stall the retry loop forever, so a dial that
 // has not reached READY within this budget counts as a failed attempt.
-constexpr auto kConnectTimeout = std::chrono::seconds(2);
-constexpr auto kConnectPollSlice = std::chrono::milliseconds(200);
+constexpr auto K_CONNECT_TIMEOUT = std::chrono::seconds(2);
+constexpr auto K_CONNECT_POLL_SLICE = std::chrono::milliseconds(200);
 
 // Retry pacing: the wait grows with every consecutive failed attempt, is capped
 // at kRetryMax and is jittered so that several publishers which lost the same
 // subscriber do not all come back on the same tick.
-constexpr auto kRetryInitial = std::chrono::milliseconds(1000);
-constexpr auto kRetryMax = std::chrono::milliseconds(15000);
-constexpr int kMaxBackoffShift = 4;
+constexpr auto K_RETRY_INITIAL = std::chrono::milliseconds(1000);
+constexpr auto K_RETRY_MAX = std::chrono::milliseconds(15000);
+constexpr int K_MAX_BACKOFF_SHIFT = 4;
 
 // Keepalive bounds how long a silently dropped network stays unnoticed: without
 // it the blocking Write below simply waits on a dead TCP connection until the
@@ -58,24 +58,24 @@ constexpr int kMaxBackoffShift = 4;
 // perfectly healthy stream into "keepalive watchdog timeout" every ~15s.
 // Keeping the ping cadence an order of magnitude above the push cadence makes
 // it reliable; the price is the detection budget below.
-constexpr int kKeepAliveTimeMs = 30000;
-constexpr int kKeepAliveTimeoutMs = 10000;
+constexpr int K_KEEP_ALIVE_TIME_MS = 30000;
+constexpr int K_KEEP_ALIVE_TIMEOUT_MS = 10000;
 
 std::atomic<bool> g_stop{false};
 std::mutex g_log_mu;
 
-void HandleSignal(int) { g_stop.store(true); }
+void handleSignal(int) { g_stop.store(true); }
 
 // Each publisher runs on its own thread; keep the shared stdout from interleaving.
-void Log(const std::string& line) {
+void log(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_log_mu);
     std::cout << line << std::endl;
 }
 
-std::string FormatTimestamp() {
-    const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+std::string formatTimestamp() {
+    const std::time_t NOW = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm tm_buf{};
-    localtime_r(&now, &tm_buf);
+    localtime_r(&NOW, &tm_buf);
     std::ostringstream oss;
     oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
     return oss.str();
@@ -84,43 +84,43 @@ std::string FormatTimestamp() {
 // Waits out `duration` in short slices: a signal handler cannot touch the
 // mutex/condition variable, so the flag is polled while waiting. Serves both as
 // the push cadence and as the retry backoff, and returns early on Ctrl-C.
-void WaitInterruptible(std::chrono::milliseconds duration) {
-    const auto deadline = std::chrono::steady_clock::now() + duration;
+void waitInterruptible(std::chrono::milliseconds duration) {
+    const auto DEADLINE = std::chrono::steady_clock::now() + duration;
     while (!g_stop.load()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) return;
-        std::this_thread::sleep_until(std::min(deadline, now + kSleepSlice));
+        const auto NOW = std::chrono::steady_clock::now();
+        if (NOW >= DEADLINE) return;
+        std::this_thread::sleep_until(std::min(DEADLINE, NOW + K_SLEEP_SLICE));
     }
 }
 
 // Jittered exponential backoff. The generator is per thread because every
 // publisher retries on its own thread and rand() is not the place for that.
-std::chrono::milliseconds BackoffDelay(int consecutive_failures) {
-    thread_local std::mt19937 generator(
+std::chrono::milliseconds backoffDelay(int consecutive_failures) {
+    thread_local std::mt19937 s_generator(
         static_cast<unsigned int>(std::chrono::steady_clock::now().time_since_epoch().count()));
-    const int shift = std::min(consecutive_failures, kMaxBackoffShift);
-    const auto ceiling = std::min(kRetryInitial * (1 << shift), kRetryMax);
-    std::uniform_int_distribution<int> jitter(0, static_cast<int>(ceiling.count()) - 1);
-    return std::chrono::milliseconds(jitter(generator));
+    const int SHIFT = std::min(consecutive_failures, K_MAX_BACKOFF_SHIFT);
+    const auto CEILING = std::min(K_RETRY_INITIAL * (1 << SHIFT), K_RETRY_MAX);
+    std::uniform_int_distribution<int> jitter(0, static_cast<int>(CEILING.count()) - 1);
+    return std::chrono::milliseconds(jitter(s_generator));
 }
 
 // A fresh channel per attempt: a new subscriber process, a restarted network
 // interface or a recovered link is then redialled immediately instead of
 // waiting out the reconnect backoff of a channel that already gave up.
-std::shared_ptr<Channel> CreateChannel(const std::string& address) {
+std::shared_ptr<Channel> createChannel(const std::string& address) {
     ChannelArguments args;
-    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepAliveTimeMs);
-    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepAliveTimeoutMs);
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, K_KEEP_ALIVE_TIME_MS);
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, K_KEEP_ALIVE_TIMEOUT_MS);
     // 0 = unlimited pings between data frames, so a peer that does count them
     // never answers our heartbeat with a GOAWAY.
     args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
-    args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, static_cast<int>(kRetryInitial.count()));
-    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, static_cast<int>(kRetryInitial.count()));
-    args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, static_cast<int>(kRetryMax.count()));
+    args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, static_cast<int>(K_RETRY_INITIAL.count()));
+    args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, static_cast<int>(K_RETRY_INITIAL.count()));
+    args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, static_cast<int>(K_RETRY_MAX.count()));
     return grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args);
 }
 
-const char* ConnectivityName(grpc_connectivity_state state) {
+const char* connectivityName(grpc_connectivity_state state) {
     switch (state) {
         case GRPC_CHANNEL_IDLE:
             return "IDLE";
@@ -142,17 +142,17 @@ const char* ConnectivityName(grpc_connectivity_state state) {
 std::mutex g_registry_mu;
 std::vector<ClientContext*> g_contexts;
 
-void RegisterContext(ClientContext* context) {
+void registerContext(ClientContext* context) {
     std::lock_guard<std::mutex> lk(g_registry_mu);
     g_contexts.push_back(context);
 }
 
-void UnregisterContext(ClientContext* context) {
+void unregisterContext(ClientContext* context) {
     std::lock_guard<std::mutex> lk(g_registry_mu);
     g_contexts.erase(std::remove(g_contexts.begin(), g_contexts.end(), context), g_contexts.end());
 }
 
-void CancelAllContexts() {
+void cancelAllContexts() {
     std::lock_guard<std::mutex> lk(g_registry_mu);
     for (ClientContext* context : g_contexts) {
         context->TryCancel();
@@ -174,19 +174,19 @@ class TimePubClient {
 public:
     explicit TimePubClient(std::string address) : address_(std::move(address)) {}
 
-    void Run() {
+    void run() {
         int consecutive_failures = 0;
         while (!g_stop.load()) {
-            const bool established = PushOnce(consecutive_failures);
+            const bool ESTABLISHED = pushOnce(consecutive_failures);
             if (g_stop.load()) break;
 
             // A stream that came up clears the penalty; only attempts that never
             // reached the subscriber make the backoff grow.
-            consecutive_failures = established ? 0 : consecutive_failures + 1;
+            consecutive_failures = ESTABLISHED ? 0 : consecutive_failures + 1;
 
-            const auto delay = BackoffDelay(consecutive_failures);
-            Log("[" + address_ + "] Retrying in " + std::to_string(delay.count()) + "ms");
-            WaitInterruptible(delay);
+            const auto DELAY = backoffDelay(consecutive_failures);
+            log("[" + address_ + "] Retrying in " + std::to_string(DELAY.count()) + "ms");
+            waitInterruptible(DELAY);
         }
     }
 
@@ -194,21 +194,21 @@ private:
     // Blocks until the transport reports READY, so "subscriber unreachable" is
     // detected here instead of surfacing later as a failed Write. Returns false
     // on timeout or Ctrl-C, which the caller treats as a failed attempt.
-    bool WaitForChannelReady(Channel* channel) {
-        const auto deadline = std::chrono::system_clock::now() + kConnectTimeout;
+    bool waitForChannelReady(Channel* channel) {
+        const auto DEADLINE = std::chrono::system_clock::now() + K_CONNECT_TIMEOUT;
         grpc_connectivity_state state = channel->GetState(/*try_to_connect=*/true);
         while (state != GRPC_CHANNEL_READY) {
-            if (g_stop.load() || std::chrono::system_clock::now() >= deadline) {
+            if (g_stop.load() || std::chrono::system_clock::now() >= DEADLINE) {
                 if (!g_stop.load()) {
-                    Log("[" + address_ + "] " + address_ + " not reachable, channel state " +
-                        ConnectivityName(state));
+                    log("[" + address_ + "] " + address_ + " not reachable, channel state " +
+                        connectivityName(state));
                 }
                 return false;
             }
             // No logging in here on purpose: a channel that cannot be reached
             // cycles IDLE/CONNECTING/TRANSIENT_FAILURE several times inside one
             // attempt, and only the verdict above is worth printing.
-            channel->WaitForStateChange(state, std::min(deadline, std::chrono::system_clock::now() + kConnectPollSlice));
+            channel->WaitForStateChange(state, std::min(DEADLINE, std::chrono::system_clock::now() + K_CONNECT_POLL_SLICE));
             state = channel->GetState(/*try_to_connect=*/true);
         }
         return true;
@@ -218,25 +218,25 @@ private:
     // kPushInterval until the subscriber half-closes, the connection dies or
     // Ctrl-C arrives. Returns whether a stream was established at all, so that
     // Run() can tell a first connect apart from a failed one and pace retries.
-    bool PushOnce(int consecutive_failures) {
-        std::shared_ptr<Channel> channel = CreateChannel(address_);
-        if (!WaitForChannelReady(channel.get())) {
+    bool pushOnce(int consecutive_failures) {
+        std::shared_ptr<Channel> channel = createChannel(address_);
+        if (!waitForChannelReady(channel.get())) {
             return false;
         }
 
         if (pushed_ == 0) {
-            Log("[" + address_ + "] Connected, pushing date/time every " + std::to_string(kPushInterval.count()) +
+            log("[" + address_ + "] Connected, pushing date/time every " + std::to_string(K_PUSH_INTERVAL.count()) +
                 "s; press Ctrl-C to stop.");
         } else if (consecutive_failures == 0) {
-            Log("[" + address_ + "] Connection recovered, resuming date/time at #" + std::to_string(pushed_ + 1));
+            log("[" + address_ + "] Connection recovered, resuming date/time at #" + std::to_string(pushed_ + 1));
         } else {
-            Log("[" + address_ + "] Connection recovered after " + std::to_string(consecutive_failures) +
+            log("[" + address_ + "] Connection recovered after " + std::to_string(consecutive_failures) +
                 " failed attempt(s), resuming date/time at #" + std::to_string(pushed_ + 1));
         }
 
         std::unique_ptr<TimePubService::Stub> stub = TimePubService::NewStub(channel);
         ClientContext context;
-        RegisterContext(&context);
+        registerContext(&context);
 
         std::unique_ptr<ClientReaderWriter<TimePublisher, TimeSubscriber>> stream = stub->Stream(&context);
 
@@ -246,13 +246,13 @@ private:
         TimePublisher message;
         bool write_failed = false;
         while (!g_stop.load()) {
-            WaitInterruptible(kPushInterval);
+            waitInterruptible(K_PUSH_INTERVAL);
             if (g_stop.load()) break;
 
             ++pushed_;
             message.set_opcode(Opcode::STATUS);
             message.set_id(pushed_);
-            message.set_message(FormatTimestamp());
+            message.set_message(formatTimestamp());
             message.set_success(true);
             message.set_result(0.0F);
             if (!stream->Write(message)) {
@@ -263,16 +263,16 @@ private:
 
         stream->WritesDone();
         Status status = stream->Finish();
-        UnregisterContext(&context);
+        unregisterContext(&context);
 
         if (g_stop.load()) {
-            Log("[" + address_ + "] Stream finished: " + status.error_message());
+            log("[" + address_ + "] Stream finished: " + status.error_message());
         } else {
             // Either the write failed (peer gone, or keepalive reaped a network
             // that went silent for kKeepAliveTimeMs + kKeepAliveTimeoutMs) or the
             // subscriber half-closed between two pushes. Both mean the same thing
             // here: the stream is gone, reconnect.
-            Log("[" + address_ + "] " + (write_failed ? "Connection lost" : "Stream closed") + ": " +
+            log("[" + address_ + "] " + (write_failed ? "Connection lost" : "Stream closed") + ": " +
                 std::to_string(status.error_code()) + " " + status.error_message());
         }
         return true;
@@ -293,9 +293,9 @@ int main(int argc, char** argv) {
     std::thread signal_thread([&signals]() {
         int signal_number = 0;
         if (sigwait(&signals, &signal_number) == 0) {
-            Log("Received signal " + std::to_string(signal_number) + ", cancelling streams");
-            HandleSignal(signal_number);
-            CancelAllContexts();
+            log("Received signal " + std::to_string(signal_number) + ", cancelling streams");
+            handleSignal(signal_number);
+            cancelAllContexts();
         }
     });
     // Nothing to join: the thread stays parked in sigwait until the process exits.
@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
     for (const auto& address : addresses) {
         threads.emplace_back([address]() {
             TimePubClient publisher(address);
-            publisher.Run();
+            publisher.run();
         });
     }
 

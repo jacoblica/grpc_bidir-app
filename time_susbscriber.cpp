@@ -25,7 +25,7 @@ namespace {
 std::mutex g_log_mu;
 
 // Each stream is handled on its own gRPC sync thread; keep stdout readable.
-void Log(const std::string& line) {
+void log(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_log_mu);
     std::cout << line << std::endl;
 }
@@ -39,18 +39,18 @@ public:
     // Note the generated sync signature is ServerReaderWriter<W, R>: the *write*
     // type comes first, so this reads TimePublisher and would write TimeSubscriber.
     Status Stream(ServerContext* context, ServerReaderWriter<TimeSubscriber, TimePublisher>* stream) override {
-        const std::string peer = context->peer();
-        Log("[" + peer + "] Time publisher connected");
+        const std::string PEER = context->peer();
+        log("[" + PEER + "] Time publisher connected");
 
         // Blocking read/write loop: one blocking Read per pushed message. Read
         // returns false when the publisher half-closes or goes away. The
         // publishers never write, so this simply parks until they leave.
         TimePublisher message;
         while (stream->Read(&message)) {
-            Log("[" + peer + "] #" + std::to_string(message.id()) + " " + message.message());
+            log("[" + PEER + "] #" + std::to_string(message.id()) + " " + message.message());
         }
 
-        Log("[" + peer + "] Time publisher disconnected");
+        log("[" + PEER + "] Time publisher disconnected");
         if (context->IsCancelled()) {
             return Status(StatusCode::CANCELLED, "Subscriber shutting down");
         }
@@ -58,7 +58,7 @@ public:
     }
 };
 
-void RunListener(const std::string& listen_address) {
+void runListener(const std::string& listen_address) {
     // Block the signals here so the dedicated thread below can wait for them
     // safely; Shutdown() must not be called from a signal handler.
     sigset_t signals;
@@ -81,7 +81,7 @@ void RunListener(const std::string& listen_address) {
     std::thread signal_thread([&server, &signals]() {
         int signal_number = 0;
         if (sigwait(&signals, &signal_number) == 0) {
-            Log("Received signal " + std::to_string(signal_number) + ", shutting down");
+            log("Received signal " + std::to_string(signal_number) + ", shutting down");
             // The deadline is what unblocks the in-flight blocking Read; without
             // it Wait() would hang until the publisher disconnected on its own.
             server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
@@ -97,6 +97,6 @@ void RunListener(const std::string& listen_address) {
 
 int main(int argc, char** argv) {
     std::string address = (argc > 1) ? argv[1] : "0.0.0.0:50051";
-    RunListener(address);
+    runListener(address);
     return 0;
 }
