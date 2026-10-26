@@ -1,9 +1,12 @@
 #include <chrono>
 #include <csignal>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <grpcpp/grpcpp.h>
@@ -23,6 +26,20 @@ using bidir::Opcode;
 namespace {
 
 std::mutex g_log_mu;
+
+// Local wall-clock time with millisecond precision.
+std::string nowTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto millis =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    localtime_r(&time, &local_time);
+    std::ostringstream out;
+    out << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0')
+        << std::setw(3) << millis.count();
+    return out.str();
+}
 
 // Each stream is handled on its own gRPC sync thread; keep stdout readable.
 void log(const std::string& line) {
@@ -47,7 +64,8 @@ public:
         // publishers never write, so this simply parks until they leave.
         TimePublisher message;
         while (stream->Read(&message)) {
-            log("[" + PEER + "] #" + std::to_string(message.id()) + " " + message.message());
+            log("[" + nowTimestamp() + "] [" + PEER + "] #" + std::to_string(message.id()) + " " +
+                message.message());
         }
 
         log("[" + PEER + "] Time publisher disconnected");

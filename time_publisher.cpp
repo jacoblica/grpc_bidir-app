@@ -28,7 +28,7 @@ using bidir::Opcode;
 
 namespace {
 
-constexpr auto K_PUSH_INTERVAL = std::chrono::seconds(3);
+constexpr auto K_PUSH_INTERVAL = std::chrono::milliseconds(20);
 constexpr auto K_SLEEP_SLICE = std::chrono::milliseconds(200);
 
 // One connection attempt may not stall the retry loop forever, so a dial that
@@ -73,11 +73,15 @@ void log(const std::string& line) {
 }
 
 std::string formatTimestamp() {
-    const std::time_t NOW = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    const auto NOW = std::chrono::system_clock::now();
+    const auto NANOS =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(NOW.time_since_epoch()) % 1000000000;
+    const std::time_t TIME = std::chrono::system_clock::to_time_t(NOW);
     std::tm tm_buf{};
-    localtime_r(&NOW, &tm_buf);
+    localtime_r(&TIME, &tm_buf);
     std::ostringstream oss;
-    oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+    oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0') << std::setw(9)
+        << NANOS.count();
     return oss.str();
 }
 
@@ -259,6 +263,7 @@ private:
                 write_failed = true;
                 break;
             }
+            log("[" + address_ + "] #" + std::to_string(message.id()) + " " + message.message());
         }
 
         stream->WritesDone();
